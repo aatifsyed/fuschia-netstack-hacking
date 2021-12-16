@@ -18,3 +18,7 @@ do
     curl --fail "https://fuchsia.googlesource.com/fuchsia/+archive/$when/${folder_src_path[$folder]}.tar.gz" \
         | tar --extract --gzip --file - --verbose --directory "$folder"
 done
+
+curl --fail "https://fuchsia.googlesource.com/fuchsia/+/$when/LICENSE?format=TEXT" \
+    | base64 --decode \
+    > LICENSE
