@@ -1,6 +1,8 @@
-# Sources
-- https://fuchsia.googlesource.com/fuchsia/+archive/refs/heads/main/src/lib/network/packet.tar.gz
-- https://fuchsia.googlesource.com/fuchsia/+archive/refs/heads/main/src/connectivity/lib/packet-formats.tar.gz
-- https://fuchsia.googlesource.com/fuchsia/+archive/refs/heads/main/src/connectivity/network/netstack3/core/fakestd.tar.gz
-- https://fuchsia.googlesource.com/fuchsia/+archive/refs/heads/main/src/connectivity/lib/net-types.tar.gz
-- https://fuchsia.googlesource.com/fuchsia/+archive/refs/heads/main/src/connectivity/network/lib/explicit.tar.gz
+A workspace for playing with Fuschia's netstack.
+
+# Links
+-  https://fuchsia.dev/fuchsia-src/contribute/roadmap/2021/netstack3
+- https://www.youtube.com/watch?v=UfMOOxOGCmA
+
+# License
+See headers in source files
