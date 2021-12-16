@@ -1,6 +1,3 @@
 [workspace]
 
-members = [
-   "packet", 
-]
-
+members = ["packet", "packet-formats"]
