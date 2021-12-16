@@ -1,10 +1,10 @@
 [package]
-name = "packet-formats"
-version = "0.0.0"
+name = "net-types"
+version = "0.1.0"
 edition = "2021"
-publish = false
+publish = ["metaswitch"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-fakestd = { path = "../fakestd" }
+zerocopy = "0.6.1"
