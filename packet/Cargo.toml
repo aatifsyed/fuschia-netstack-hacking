@@ -8,7 +8,6 @@ publish = false
 
 [dependencies]
 arrayvec = "0.7.2"
-byteorder = "1.4.3"
 nonzero_ext = "0.3.0"
 zerocopy = "0.6.1"
 
