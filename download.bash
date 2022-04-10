@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-set -o errexit -o xtrace -o pipefail
+set -o errexit -o xtrace -o pipefail -o nounset
 
+# See https://fuchsia.googlesource.com/fuchsia/+/refs/heads/main
 #when=refs/heads/main
-when=34f9f202bfc376baf693ae652e0af6036b64f5b7
+when=43f806db60eba587110bc85a505e310d79cae013 # Sun Apr 10 15:37:29 2022 +0000
 
 declare -A folder_src_path
 folder_src_path=(

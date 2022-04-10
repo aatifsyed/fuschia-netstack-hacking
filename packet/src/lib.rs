@@ -2389,6 +2389,7 @@ mod tests {
             #[test]
             #[should_panic]
             fn $nonsense_shrink_panics() {
+                #[allow(clippy::reversed_empty_ranges)] // Intentionally testing with invalid range
                 ($new_empty_buffer).shrink(1..0);
             }
         };

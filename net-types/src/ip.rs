@@ -275,6 +275,9 @@ pub trait Ip:
     ///
     /// [`Ipv4Addr`] for IPv4 and [`Ipv6Addr`] for IPv6.
     type Addr: IpAddress<Version = Self>;
+
+    /// The interface address type for this IP version.
+    type InterfaceAddress: Send + 'static + Into<InterfaceAddr> + Display + Debug;
 }
 
 /// IPv4.
@@ -333,6 +336,7 @@ impl Ip for Ipv4 {
     /// [RFC 791 Section 3.2]: https://tools.ietf.org/html/rfc791#section-3.2
     const MINIMUM_LINK_MTU: u16 = 68;
     type Addr = Ipv4Addr;
+    type InterfaceAddress = AddrSubnet<Ipv4Addr>;
 }
 
 impl Ipv4 {
@@ -471,6 +475,7 @@ impl Ip for Ipv6 {
     /// [RFC 8200 Section 5]: https://tools.ietf.org/html/rfc8200#section-5
     const MINIMUM_LINK_MTU: u16 = 1280;
     type Addr = Ipv6Addr;
+    type InterfaceAddress = UnicastAddr<Ipv6Addr>;
 }
 
 impl Ipv6 {
@@ -1042,8 +1047,7 @@ impl ScopeableAddress for IpAddr {
 ///   $witness<IpAddr>`
 /// - `From<$witness<IpAddr>> for IpAddr<$witness<Ipv4Addr>,
 ///   $witness<Ipv6Addr>>`
-/// - `From<$witness<Ipv4Addr>> for $witness<IpAddr>`
-/// - `From<$witness<Ipv6Addr>> for $witness<IpAddr>`
+/// - `From<$witness<A>> for $witness<A>`
 /// - `From<$witness<Ipv4Addr>> for IpAddr`
 /// - `From<$witness<Ipv6Addr>> for IpAddr`
 /// - `TryFrom<Ipv4Addr> for $witness<Ipv4Addr>`
@@ -1055,9 +1059,6 @@ impl ScopeableAddress for IpAddr {
 /// - `TryFrom<$ipaddr> for $witness<$ipaddr>`
 macro_rules! impl_from_witness {
     ($witness:ident) => {
-        impl_from_witness!($witness, Ipv4Addr, Witness::new_unchecked);
-        impl_from_witness!($witness, Ipv6Addr, Witness::new_unchecked);
-
         impl From<IpAddr<$witness<Ipv4Addr>, $witness<Ipv6Addr>>> for $witness<IpAddr> {
             fn from(addr: IpAddr<$witness<Ipv4Addr>, $witness<Ipv6Addr>>) -> $witness<IpAddr> {
                 unsafe {
@@ -1076,6 +1077,41 @@ macro_rules! impl_from_witness {
                         IpAddr::V6(addr) => IpAddr::V6(Witness::new_unchecked(addr)),
                     }
                 }
+            }
+        }
+        impl<A: IpAddress> From<$witness<A>> for $witness<IpAddr> {
+            fn from(addr: $witness<A>) -> $witness<IpAddr> {
+                unsafe { Witness::new_unchecked(addr.to_ip_addr()) }
+            }
+        }
+        impl<A: IpAddress> From<$witness<A>> for IpAddr<$witness<Ipv4Addr>, $witness<Ipv6Addr>> {
+            fn from(addr: $witness<A>) -> IpAddr<$witness<Ipv4Addr>, $witness<Ipv6Addr>> {
+                let addr: $witness<IpAddr> = addr.into();
+                addr.into()
+            }
+        }
+        // NOTE: Orphan rules prevent implementing `From` for `A: IpAddress`.
+        impl From<$witness<Ipv4Addr>> for Ipv4Addr {
+            fn from(addr: $witness<Ipv4Addr>) -> Ipv4Addr {
+                addr.get()
+            }
+        }
+        impl From<$witness<Ipv6Addr>> for Ipv6Addr {
+            fn from(addr: $witness<Ipv6Addr>) -> Ipv6Addr {
+                addr.get()
+            }
+        }
+        // NOTE: Orphan rules prevent implementing `TryFrom` for `A: IpAddress`.
+        impl TryFrom<Ipv4Addr> for $witness<Ipv4Addr> {
+            type Error = ();
+            fn try_from(addr: Ipv4Addr) -> Result<$witness<Ipv4Addr>, ()> {
+                Witness::new(addr).ok_or(())
+            }
+        }
+        impl TryFrom<Ipv6Addr> for $witness<Ipv6Addr> {
+            type Error = ();
+            fn try_from(addr: Ipv6Addr) -> Result<$witness<Ipv6Addr>, ()> {
+                Witness::new(addr).ok_or(())
             }
         }
     };
@@ -1235,13 +1271,11 @@ impl IpAddress for Ipv4Addr {
     #[inline]
     fn mask(&self, bits: u8) -> Self {
         assert!(bits <= 32);
-        if bits == 0 {
-            // shifting left by the size of the value is undefined
-            Ipv4Addr([0; 4])
-        } else {
-            let mask = <u32>::max_value() << (32 - bits);
-            Self::new((u32::from_be_bytes(self.0) & mask).to_be_bytes())
-        }
+        // Need to perform a checked shift left in case `bits == 32`, in which
+        // case an unchecked shift left (`u32::MAX << bits`) would overflow,
+        // causing a panic in debug mode.
+        let mask = u32::MAX.checked_shl((32 - bits).into()).unwrap_or(0);
+        Ipv4Addr((u32::from_be_bytes(self.0) & mask).to_be_bytes())
     }
 
     #[inline]
@@ -1532,13 +1566,11 @@ impl IpAddress for Ipv6Addr {
     #[inline]
     fn mask(&self, bits: u8) -> Ipv6Addr {
         assert!(bits <= 128);
-        if bits == 0 {
-            // shifting left by the size of the value is undefined
-            Ipv6Addr([0; 16])
-        } else {
-            let mask = <u128>::max_value() << (128 - bits);
-            Ipv6Addr::from((u128::from_be_bytes(self.0) & mask).to_be_bytes())
-        }
+        // Need to perform a checked shift left in case `bits == 128`, in which
+        // case an unchecked shift left (`u128::MAX << bits`) would overflow,
+        // causing a panic in debug mode.
+        let mask = u128::MAX.checked_shl((128 - bits).into()).unwrap_or(0);
+        Ipv6Addr((u128::from_be_bytes(self.0) & mask).to_be_bytes())
     }
 
     #[inline]
@@ -1766,18 +1798,6 @@ pub enum Ipv6SourceAddr {
     Unspecified,
 }
 
-impl Ipv6SourceAddr {
-    /// Converts this `Ipv6SourceAddr` into an `Option<UnicastAddr<Ipv6Addr>>`,
-    /// mapping [`Ipv6SourceAddr::Unspecified`] to `None`.
-    #[inline]
-    pub fn to_option(&self) -> Option<UnicastAddr<Ipv6Addr>> {
-        match *self {
-            Ipv6SourceAddr::Unicast(addr) => Some(addr),
-            Ipv6SourceAddr::Unspecified => None,
-        }
-    }
-}
-
 impl crate::sealed::Sealed for Ipv6SourceAddr {}
 
 impl Ipv6SourceAddr {
@@ -1860,12 +1880,6 @@ impl TryFrom<Ipv6Addr> for Ipv6SourceAddr {
     type Error = ();
     fn try_from(addr: Ipv6Addr) -> Result<Ipv6SourceAddr, ()> {
         Ipv6SourceAddr::new(addr).ok_or(())
-    }
-}
-
-impl From<Ipv6SourceAddr> for Option<UnicastAddr<Ipv6Addr>> {
-    fn from(addr: Ipv6SourceAddr) -> Option<UnicastAddr<Ipv6Addr>> {
-        addr.to_option()
     }
 }
 
@@ -2054,6 +2068,11 @@ pub enum SubnetError {
     HostBitsSet,
 }
 
+/// A prefix was provided which is longer than the number of bits in the address
+/// (32 for IPv4/128 for IPv6).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct PrefixTooLongError;
+
 /// An IP subnet.
 ///
 /// `Subnet` is a combination of an IP network address and a prefix length.
@@ -2097,6 +2116,20 @@ impl<A: IpAddress> Subnet<A> {
         if network != network.mask(prefix) {
             return Err(SubnetError::HostBitsSet);
         }
+        Ok(Subnet { network, prefix })
+    }
+
+    /// Creates a new subnet from the address of a host in that subnet.
+    ///
+    /// Unlike [`new`], the `host` address may have host bits set.
+    ///
+    /// [`new`]: Subnet::new
+    #[inline]
+    pub fn from_host(host: A, prefix: u8) -> Result<Subnet<A>, PrefixTooLongError> {
+        if prefix > A::BYTES * 8 {
+            return Err(PrefixTooLongError);
+        }
+        let network = host.mask(prefix);
         Ok(Subnet { network, prefix })
     }
 
@@ -2183,6 +2216,19 @@ impl SubnetEither {
         Ok(match network {
             IpAddr::V4(network) => SubnetEither::V4(Subnet::new(network, prefix)?),
             IpAddr::V6(network) => SubnetEither::V6(Subnet::new(network, prefix)?),
+        })
+    }
+
+    /// Creates a new subnet from the address of a host in that subnet.
+    ///
+    /// Unlike [`new`], the `host` address may have host bits set.
+    ///
+    /// [`new`]: SubnetEither::new
+    #[inline]
+    pub fn from_host(host: IpAddr, prefix: u8) -> Result<SubnetEither, PrefixTooLongError> {
+        Ok(match host {
+            IpAddr::V4(host) => SubnetEither::V4(Subnet::from_host(host, prefix)?),
+            IpAddr::V6(host) => SubnetEither::V6(Subnet::from_host(host, prefix)?),
         })
     }
 
@@ -2294,6 +2340,13 @@ impl<S: IpAddress, A: Witness<S> + Copy> AddrSubnet<S, A> {
     }
 }
 
+impl<S: IpAddress, A: Witness<S> + Copy + Display> Display for AddrSubnet<S, A> {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+        write!(f, "{}/{}", self.addr, self.subnet.prefix)
+    }
+}
+
 impl<A: Witness<Ipv6Addr> + Copy> AddrSubnet<Ipv6Addr, A> {
     /// Gets the address as a [`UnicastAddr`] witness.
     ///
@@ -2316,6 +2369,38 @@ impl<A: Witness<Ipv6Addr> + Copy> AddrSubnet<Ipv6Addr, A> {
     }
 }
 
+/// A type which is witness to some property about an [`IpAddress`], `A`.
+///
+/// `IpAddressWitness<A>` extends [`Witness`] of the `IpAddress` type `A` by
+/// adding an associated type for the type-erased `IpAddr` version of the same
+/// witness type. For example, the following implementation is provided for
+/// `SpecifiedAddr<A>`:
+///
+/// ```rust,ignore
+/// impl<A: IpAddress> IpAddressWitness<A> for SpecifiedAddr<A> {
+///     type IpAddrWitness = SpecifiedAddr<IpAddr>;
+/// }
+/// ```
+pub trait IpAddressWitness<A: IpAddress>: Witness<A> {
+    /// The type-erased version of `Self`.
+    ///
+    /// For example, `SpecifiedAddr<Ipv4Addr>: IpAddressWitness<IpAddrWitness =
+    /// SpecifiedAddr<IpAddr>>`.
+    type IpAddrWitness: IpAddrWitness + From<Self>;
+}
+
+macro_rules! impl_ip_address_witness {
+    ($witness:ident) => {
+        impl<A: IpAddress> IpAddressWitness<A> for $witness<A> {
+            type IpAddrWitness = $witness<IpAddr>;
+        }
+    };
+}
+
+impl_ip_address_witness!(SpecifiedAddr);
+impl_ip_address_witness!(MulticastAddr);
+impl_ip_address_witness!(LinkLocalAddr);
+
 /// A type which is a witness to some property about an [`IpAddress`].
 ///
 /// `IpAddrWitness` extends [`Witness`] of [`IpAddr`] by adding associated types
@@ -2329,7 +2414,7 @@ impl<A: Witness<Ipv6Addr> + Copy> AddrSubnet<Ipv6Addr, A> {
 ///     type V6 = SpecifiedAddr<Ipv6Addr>;
 /// }
 /// ```
-pub trait IpAddrWitness: Witness<IpAddr> + Copy {
+pub trait IpAddrWitness: Witness<IpAddr> + Into<IpAddr<Self::V4, Self::V6>> + Copy {
     /// The IPv4-specific version of `Self`.
     ///
     /// For example, `SpecifiedAddr<IpAddr>: IpAddrWitness<V4 =
@@ -2412,6 +2497,61 @@ impl<A: IpAddrWitness> AddrSubnetEither<A> {
             AddrSubnetEither::V4(v4) => (v4.addr.into(), SubnetEither::V4(v4.subnet)),
             AddrSubnetEither::V6(v6) => (v6.addr.into(), SubnetEither::V6(v6.subnet)),
         }
+    }
+}
+
+impl<S: IpAddress, A: IpAddressWitness<S> + Copy> From<AddrSubnet<S, A>>
+    for AddrSubnetEither<A::IpAddrWitness>
+{
+    #[inline]
+    fn from(addr_sub: AddrSubnet<S, A>) -> AddrSubnetEither<A::IpAddrWitness> {
+        let (addr, sub) = addr_sub.addr_subnet();
+        // This unwrap is safe because:
+        // - `addr_sub: AddrSubnet<S, A>`, so we know that `addr` and
+        //   `sub.prefix` are valid arguments to `AddrSubnet::new` (which is
+        //   what `AddrSubnetEither::new` calls under the hood).
+        // - `A::IpAddrWitness` is the same witness type as `A`, but wrapping
+        //   `IpAddr` instead of `Ipv4Addr` or `Ipv6Addr`. `addr: A` means that
+        //   `addr` satisfies the property witnessed by the witness type `A`,
+        //   which is the same property witnessed by `A::IpAddrWitness`. Thus,
+        //   we're guaranteed that, when `AddrSubnetEither::new` tries to
+        //   construct the witness, it will succeed.
+        AddrSubnetEither::new(addr.get().to_ip_addr(), sub.prefix()).unwrap()
+    }
+}
+
+/// An address that can be assigned to an interface.
+///
+/// `InterfaceAddr` upholds the following invariants:
+/// - Addresses must be unicast.
+/// - IPv4 addresses have a defined containing subnet so the broadcast address
+/// is known.
+#[allow(missing_docs)]
+#[derive(Clone, Eq, PartialEq, Debug, Hash)]
+pub enum InterfaceAddr {
+    V4(AddrSubnet<Ipv4Addr>),
+    V6(UnicastAddr<Ipv6Addr>),
+}
+
+impl Display for InterfaceAddr {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+        match self {
+            Self::V4(a) => write!(f, "{}", a),
+            Self::V6(a) => write!(f, "{}", a),
+        }
+    }
+}
+
+impl From<AddrSubnet<Ipv4Addr>> for InterfaceAddr {
+    fn from(a: AddrSubnet<Ipv4Addr>) -> Self {
+        Self::V4(a)
+    }
+}
+
+impl From<UnicastAddr<Ipv6Addr>> for InterfaceAddr {
+    fn from(a: UnicastAddr<Ipv6Addr>) -> Self {
+        Self::V6(a)
     }
 }
 
@@ -2521,8 +2661,17 @@ mod tests {
             Subnet::new(Ipv4Addr::new([255, 255, 0, 0]), 33),
             Err(SubnetError::PrefixTooLong)
         );
+        assert_eq!(
+            Subnet::from_host(Ipv4Addr::new([255, 255, 255, 255]), 33),
+            Err(PrefixTooLongError)
+        );
         // Network address has more than top 8 bits set
         assert_eq!(Subnet::new(Ipv4Addr::new([255, 255, 0, 0]), 8), Err(SubnetError::HostBitsSet));
+        // Host address is allowed to have host bits set
+        assert_eq!(
+            Subnet::from_host(Ipv4Addr::new([255, 255, 0, 0]), 8),
+            Ok(Subnet { network: Ipv4Addr::new([255, 0, 0, 0]), prefix: 8 })
+        );
 
         assert_eq!(
             AddrSubnet::<_, SpecifiedAddr<_>>::new(Ipv4Addr::new([1, 2, 3, 4]), 32).unwrap(),

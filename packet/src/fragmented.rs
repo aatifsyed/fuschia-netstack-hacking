@@ -742,6 +742,7 @@ mod tests {
     fn test_copy_within_bad_range() {
         with_fragments_mut(|mut bytes| {
             // pass a bad range (end before start)
+            #[allow(clippy::reversed_empty_ranges)]
             bytes.copy_within(5..3, 0);
         });
     }
