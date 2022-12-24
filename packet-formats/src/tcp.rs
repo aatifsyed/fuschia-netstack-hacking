@@ -25,11 +25,14 @@ use packet::{
     InnerPacketBuilder, MaybeParsed, PacketBuilder, PacketConstraints, ParsablePacket,
     ParseMetadata, SerializeBuffer, Serializer,
 };
-use zerocopy::{AsBytes, ByteSlice, FromBytes, LayoutVerified, Unaligned};
+use zerocopy::{
+    byteorder::network_endian::{U16, U32},
+    AsBytes, ByteSlice, FromBytes, LayoutVerified, Unaligned,
+};
 
 use crate::error::{ParseError, ParseResult};
 use crate::ip::IpProto;
-use crate::{compute_transport_checksum_parts, compute_transport_checksum_serialize, U16, U32};
+use crate::{compute_transport_checksum_parts, compute_transport_checksum_serialize};
 
 use self::data_offset_reserved_flags::DataOffsetReservedFlags;
 use self::options::{TcpOption, TcpOptionsImpl};
@@ -255,7 +258,7 @@ impl<B: ByteSlice, A: IpAddress> FromRaw<TcpSegmentRaw<B>, TcpParseArgs<A>> for 
             .ok_or_else(|_| debug_err!(ParseError::Format, "Incomplete options"))
             .and_then(|o| {
                 Options::try_from_raw(o)
-                    .map_err(|_| debug_err!(ParseError::Format, "Options validation failed"))
+                    .map_err(|e| debug_err!(e.into(), "Options validation failed"))
             })?;
         let body = raw.body;
 
@@ -623,6 +626,7 @@ impl<B: ByteSlice> TcpSegmentRaw<B> {
         B: 'a,
     {
         self.builder(src_ip, dst_ip).map(|builder| {
+            let _ = &self;
             ByteSliceInnerPacketBuilder(self.body).into_serializer().encapsulate(builder)
         })
     }
@@ -825,13 +829,14 @@ impl<A: IpAddress> PacketBuilder for TcpSegmentBuilder<A> {
 
 /// Parsing and serialization of TCP options.
 pub mod options {
-    use packet::records::options::{OptionBuilder, OptionLayout, OptionParseLayout, OptionsImpl};
+    use packet::records::options::{
+        OptionBuilder, OptionLayout, OptionParseErr, OptionParseLayout, OptionsImpl,
+    };
     use packet::BufferViewMut as _;
-    use zerocopy::byteorder::{ByteOrder, NetworkEndian};
+    use zerocopy::byteorder::{network_endian::U32, ByteOrder, NetworkEndian};
     use zerocopy::{AsBytes, FromBytes, LayoutVerified, Unaligned};
 
     use super::*;
-    use crate::U32;
 
     const OPTION_KIND_EOL: u8 = 0;
     const OPTION_KIND_NOP: u8 = 1;
@@ -909,7 +914,7 @@ pub mod options {
     }
 
     impl OptionParseLayout for TcpOptionsImpl {
-        type Error = ();
+        type Error = OptionParseErr;
         const END_OF_OPTIONS: Option<u8> = Some(0);
         const NOP: Option<u8> = Some(1);
     }
@@ -917,38 +922,38 @@ pub mod options {
     impl<'a> OptionsImpl<'a> for TcpOptionsImpl {
         type Option = TcpOption<'a>;
 
-        fn parse(kind: u8, data: &'a [u8]) -> Result<Option<TcpOption<'a>>, ()> {
+        fn parse(kind: u8, data: &'a [u8]) -> Result<Option<TcpOption<'a>>, OptionParseErr> {
             match kind {
                 self::OPTION_KIND_EOL | self::OPTION_KIND_NOP => {
                     unreachable!("records::options::Options promises to handle EOL and NOP")
                 }
                 self::OPTION_KIND_MSS => {
                     if data.len() != 2 {
-                        Err(())
+                        Err(OptionParseErr)
                     } else {
                         Ok(Some(TcpOption::Mss(NetworkEndian::read_u16(&data))))
                     }
                 }
                 self::OPTION_KIND_WINDOW_SCALE => {
                     if data.len() != 1 {
-                        Err(())
+                        Err(OptionParseErr)
                     } else {
                         Ok(Some(TcpOption::WindowScale(data[0])))
                     }
                 }
                 self::OPTION_KIND_SACK_PERMITTED => {
                     if !data.is_empty() {
-                        Err(())
+                        Err(OptionParseErr)
                     } else {
                         Ok(Some(TcpOption::SackPermitted))
                     }
                 }
                 self::OPTION_KIND_SACK => Ok(Some(TcpOption::Sack(
-                    LayoutVerified::new_slice(data).ok_or(())?.into_slice(),
+                    LayoutVerified::new_slice(data).ok_or(OptionParseErr)?.into_slice(),
                 ))),
                 self::OPTION_KIND_TIMESTAMP => {
                     if data.len() != 8 {
-                        Err(())
+                        Err(OptionParseErr)
                     } else {
                         let ts_val = NetworkEndian::read_u32(&data);
                         let ts_echo_reply = NetworkEndian::read_u32(&data[4..]);
@@ -1025,9 +1030,9 @@ impl<B> Debug for TcpSegment<B> {
 
 #[cfg(test)]
 mod tests {
+    use core::num::NonZeroU16;
     use net_types::ip::{Ipv4, Ipv4Addr, Ipv6Addr};
     use packet::{Buf, InnerPacketBuilder, ParseBuffer, Serializer};
-    use std::num::NonZeroU16;
     use zerocopy::byteorder::{ByteOrder, NetworkEndian};
 
     use super::*;
@@ -1384,7 +1389,7 @@ mod tests {
 
     #[test]
     fn test_partial_parse() {
-        use std::ops::Deref as _;
+        use core::ops::Deref as _;
 
         // Parse options partially:
         let make_hdr_prefix = || {

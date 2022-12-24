@@ -21,11 +21,13 @@ use packet::{
     MaybeParsed, PacketBuilder, PacketConstraints, ParsablePacket, ParseMetadata, SerializeBuffer,
     Serializer,
 };
-use zerocopy::{AsBytes, ByteSlice, FromBytes, LayoutVerified, Unaligned};
+use zerocopy::{
+    byteorder::network_endian::U16, AsBytes, ByteSlice, FromBytes, LayoutVerified, Unaligned,
+};
 
 use crate::error::{ParseError, ParseResult};
 use crate::ip::IpProto;
-use crate::{compute_transport_checksum_parts, compute_transport_checksum_serialize, U16};
+use crate::{compute_transport_checksum_parts, compute_transport_checksum_serialize};
 
 pub(crate) const HEADER_BYTES: usize = 8;
 const CHECKSUM_OFFSET: usize = 6;
@@ -496,9 +498,9 @@ impl<B> Debug for UdpPacket<B> {
 
 #[cfg(test)]
 mod tests {
+    use core::num::NonZeroU16;
     use net_types::ip::{Ipv4, Ipv4Addr, Ipv6, Ipv6Addr};
     use packet::{Buf, FragmentedBytesMut, InnerPacketBuilder, ParseBuffer, Serializer};
-    use std::num::NonZeroU16;
     use zerocopy::byteorder::{ByteOrder, NetworkEndian};
 
     use super::*;
@@ -593,7 +595,7 @@ mod tests {
 
         // length of 0 is allowed in IPv6 if the body is long enough
         let mut buf = vec![0_u8, 0, 1, 2, 0, 0, 0xBF, 0x12];
-        buf.extend((0..std::u16::MAX).into_iter().map(|p| p as u8));
+        buf.extend((0..core::u16::MAX).into_iter().map(|p| p as u8));
         let bv = &mut &buf[..];
         let packet = bv
             .parse_with::<_, UdpPacket<_>>(UdpParseArgs::new(TEST_SRC_IPV6, TEST_DST_IPV6))
@@ -601,7 +603,7 @@ mod tests {
         assert!(packet.src_port().is_none());
         assert_eq!(packet.dst_port().get(), NetworkEndian::read_u16(&[1, 2]));
         assert!(packet.checksummed());
-        assert_eq!(packet.body().len(), std::u16::MAX as usize);
+        assert_eq!(packet.body().len(), core::u16::MAX as usize);
     }
 
     #[test]
@@ -799,7 +801,7 @@ mod tests {
         // Now try same thing but with a body that's actually big enough to
         // justify len being 0.
         let mut buf = vec![0, 0, 1, 2, 0, 0, 0, 0, 10, 20];
-        buf.extend((0..std::u16::MAX).into_iter().map(|x| x as u8));
+        buf.extend((0..core::u16::MAX).into_iter().map(|x| x as u8));
         let bv = &mut &buf[..];
         let packet =
             bv.parse_with::<_, UdpPacketRaw<_>>(IpVersionMarker::<Ipv6>::default()).unwrap();

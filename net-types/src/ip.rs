@@ -64,6 +64,7 @@ use core::ops::Deref;
 #[cfg(feature = "std")]
 use std::net;
 
+pub use net_types_macros::GenericOverIp;
 use zerocopy::{AsBytes, FromBytes, Unaligned};
 
 use crate::{
@@ -92,7 +93,7 @@ pub enum IpVersion {
 /// `IpVersionMarker` behaves similarly to [`PhantomData`].
 ///
 /// [`PhantomData`]: core::marker::PhantomData
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, GenericOverIp)]
 pub struct IpVersionMarker<I: Ip> {
     _marker: core::marker::PhantomData<I>,
 }
@@ -124,6 +125,15 @@ pub enum IpAddr<V4 = Ipv4Addr, V6 = Ipv6Addr> {
     V6(V6),
 }
 
+impl<V4: Display, V6: Display> Display for IpAddr<V4, V6> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::V4(v4) => v4.fmt(f),
+            Self::V6(v6) => v6.fmt(f),
+        }
+    }
+}
+
 impl<V4, V6> IpAddr<V4, V6> {
     /// Transposes an `IpAddr` of a witness type to a witness type of an
     /// `IpAddr`.
@@ -143,6 +153,13 @@ impl<A: IpAddress> From<A> for IpAddr {
     #[inline]
     fn from(addr: A) -> IpAddr {
         addr.to_ip_addr()
+    }
+}
+
+impl<A: IpAddress, const N: usize> From<[A; N]> for IpAddr<[Ipv4Addr; N], [Ipv6Addr; N]> {
+    #[inline]
+    fn from(addrs: [A; N]) -> Self {
+        A::array_into_ip_addr(addrs)
     }
 }
 
@@ -274,10 +291,49 @@ pub trait Ip:
     /// The address type for this IP version.
     ///
     /// [`Ipv4Addr`] for IPv4 and [`Ipv6Addr`] for IPv6.
-    type Addr: IpAddress<Version = Self>;
+    type Addr: IpAddress<Version = Self>
+        + GenericOverIp<Self, Type = Self::Addr>
+        + GenericOverIp<Ipv4, Type = Ipv4Addr>
+        + GenericOverIp<Ipv6, Type = Ipv6Addr>;
 
-    /// The interface address type for this IP version.
-    type InterfaceAddress: Send + 'static + Into<InterfaceAddr> + Display + Debug;
+    /// Apply one of the given functions to the input and return the result.
+    ///
+    /// This makes it possible to implement specialized behavior for IPv4 and
+    /// IPv6 versions that is more versatile than matching on [`Ip::VERSION`].
+    /// With a `match` expression, all branches must produce a value of the
+    /// same type. `map_ip` relaxes that restriction by instead requiring that
+    /// inputs and outputs are [`GenericOverIp`].
+    ///
+    /// Using `map_ip`, you can write generic code with specialized
+    /// implementations for different IP versions where some or all of the input
+    /// and output arguments have a type parameter `I: Ip`. As an example,
+    /// consider the following:
+    ///
+    /// ```
+    /// // Swaps the order of the addresses only if `I=Ipv4`.
+    /// fn swap_only_if_ipv4<I: Ip>(addrs: (I::Addr, I::Addr)) -> (I::Addr, I::Addr) {
+    ///    I::map_ip::<(I::Addr, I::Addr), (I::Addr, I::Addr)>(
+    ///        addrs,
+    ///        |(a, b): (Ipv4Addr, Ipv4Addr)| (b, a),
+    ///        |ab: (Ipv6Addr, Ipv6Addr)| ab
+    ///    )
+    /// }
+    /// ```
+    ///
+    /// Note that the input and output arguments both depend on the type
+    /// parameter `I`, but the closures take an [`Ipv4Addr`] or [`Ipv6Addr`].
+    ///
+    /// Types that don't implement `GenericOverIp` can be wrapped in
+    /// [`IpInvariant`], which implements `GenericOverIp` assuming the type
+    /// inside doesn't have any IP-related components.
+    fn map_ip<
+        In: GenericOverIp<Self, Type = In> + GenericOverIp<Ipv4> + GenericOverIp<Ipv6>,
+        Out: GenericOverIp<Self, Type = Out> + GenericOverIp<Ipv4> + GenericOverIp<Ipv6>,
+    >(
+        input: In,
+        v4: fn(<In as GenericOverIp<Ipv4>>::Type) -> <Out as GenericOverIp<Ipv4>>::Type,
+        v6: fn(<In as GenericOverIp<Ipv6>>::Type) -> <Out as GenericOverIp<Ipv6>>::Type,
+    ) -> Out;
 }
 
 /// IPv4.
@@ -336,7 +392,17 @@ impl Ip for Ipv4 {
     /// [RFC 791 Section 3.2]: https://tools.ietf.org/html/rfc791#section-3.2
     const MINIMUM_LINK_MTU: u16 = 68;
     type Addr = Ipv4Addr;
-    type InterfaceAddress = AddrSubnet<Ipv4Addr>;
+
+    fn map_ip<
+        In: GenericOverIp<Self, Type = In> + GenericOverIp<Ipv4> + GenericOverIp<Ipv6>,
+        Out: GenericOverIp<Self, Type = Out> + GenericOverIp<Ipv4> + GenericOverIp<Ipv6>,
+    >(
+        input: In,
+        v4: fn(<In as GenericOverIp<Ipv4>>::Type) -> <Out as GenericOverIp<Ipv4>>::Type,
+        _v6: fn(<In as GenericOverIp<Ipv6>>::Type) -> <Out as GenericOverIp<Ipv6>>::Type,
+    ) -> Out {
+        v4(input)
+    }
 }
 
 impl Ipv4 {
@@ -369,7 +435,14 @@ impl Ipv4 {
     ///
     /// [RFC 5771 Section 4]: https://tools.ietf.org/html/rfc5771#section-4
     pub const LINK_LOCAL_MULTICAST_SUBNET: Subnet<Ipv4Addr> =
-        Subnet { network: Ipv4Addr::new([169, 254, 0, 0]), prefix: 16 };
+        Subnet { network: Ipv4Addr::new([224, 0, 0, 0]), prefix: 24 };
+
+    /// The multicast address subscribed to by all systems on the local network,
+    /// defined in the [IPv4 Multicast Address Space Registry].
+    ///
+    /// [IPv4 Multicast Address Space Registry]: https://www.iana.org/assignments/multicast-addresses/multicast-addresses.xhtml
+    pub const ALL_SYSTEMS_MULTICAST_ADDRESS: MulticastAddr<Ipv4Addr> =
+        unsafe { MulticastAddr::new_unchecked(Ipv4Addr::new([224, 0, 0, 1])) };
 
     /// The multicast address subscribed to by all routers on the local network,
     /// defined in the [IPv4 Multicast Address Space Registry].
@@ -475,7 +548,17 @@ impl Ip for Ipv6 {
     /// [RFC 8200 Section 5]: https://tools.ietf.org/html/rfc8200#section-5
     const MINIMUM_LINK_MTU: u16 = 1280;
     type Addr = Ipv6Addr;
-    type InterfaceAddress = UnicastAddr<Ipv6Addr>;
+
+    fn map_ip<
+        In: GenericOverIp<Self, Type = In> + GenericOverIp<Ipv4> + GenericOverIp<Ipv6>,
+        Out: GenericOverIp<Self, Type = Out> + GenericOverIp<Ipv4> + GenericOverIp<Ipv6>,
+    >(
+        input: In,
+        _v4: fn(<In as GenericOverIp<Ipv4>>::Type) -> <Out as GenericOverIp<Ipv4>>::Type,
+        v6: fn(<In as GenericOverIp<Ipv6>>::Type) -> <Out as GenericOverIp<Ipv6>>::Type,
+    ) -> Out {
+        v6(input)
+    }
 }
 
 impl Ipv6 {
@@ -569,6 +652,9 @@ pub trait IpAddress:
     + Send
     + LinkLocalAddress
     + ScopeableAddress
+    + GenericOverIp<Self::Version, Type = Self>
+    + GenericOverIp<Ipv4, Type = Ipv4Addr>
+    + GenericOverIp<Ipv6, Type = Ipv6Addr>
     + sealed::Sealed
     + 'static
 {
@@ -681,6 +767,10 @@ pub trait IpAddress:
 
     #[doc(hidden)]
     fn subnet_into_either(subnet: Subnet<Self>) -> SubnetEither;
+
+    #[doc(hidden)]
+    fn array_into_ip_addr<const N: usize>(addrs: [Self; N])
+        -> IpAddr<[Ipv4Addr; N], [Ipv6Addr; N]>;
 }
 
 impl<A: IpAddress> SpecifiedAddress for A {
@@ -779,6 +869,14 @@ impl LinkLocalAddress for IpAddr {
     fn is_link_local(&self) -> bool {
         map_ip_addr!(self, is_link_local)
     }
+}
+
+impl<I: Ip> GenericOverIp<I> for Ipv4Addr {
+    type Type = I::Addr;
+}
+
+impl<I: Ip> GenericOverIp<I> for Ipv6Addr {
+    type Type = I::Addr;
 }
 
 impl ScopeableAddress for Ipv4Addr {
@@ -1316,6 +1414,13 @@ impl IpAddress for Ipv4Addr {
     fn subnet_into_either(subnet: Subnet<Ipv4Addr>) -> SubnetEither {
         SubnetEither::V4(subnet)
     }
+
+    #[inline]
+    fn array_into_ip_addr<const N: usize>(
+        addrs: [Self; N],
+    ) -> IpAddr<[Ipv4Addr; N], [Ipv6Addr; N]> {
+        IpAddr::V4(addrs)
+    }
 }
 
 impl From<[u8; 4]> for Ipv4Addr {
@@ -1426,7 +1531,7 @@ impl Ipv6Addr {
     #[inline]
     pub fn segments(&self) -> [u16; 8] {
         #![allow(clippy::many_single_char_names)]
-        let [a, b, c, d, e, f, g, h]: [zerocopy::U16<zerocopy::NetworkEndian>; 8] =
+        let [a, b, c, d, e, f, g, h]: [zerocopy::network_endian::U16; 8] =
             zerocopy::transmute!(self.ipv6_bytes());
         [a.into(), b.into(), c.into(), d.into(), e.into(), f.into(), g.into(), h.into()]
     }
@@ -1600,6 +1705,13 @@ impl IpAddress for Ipv6Addr {
 
     fn subnet_into_either(subnet: Subnet<Ipv6Addr>) -> SubnetEither {
         SubnetEither::V6(subnet)
+    }
+
+    #[inline]
+    fn array_into_ip_addr<const N: usize>(
+        addrs: [Self; N],
+    ) -> IpAddr<[Ipv4Addr; N], [Ipv6Addr; N]> {
+        IpAddr::V6(addrs)
     }
 }
 
@@ -2481,6 +2593,14 @@ impl<A: IpAddrWitness> AddrSubnetEither<A> {
         })
     }
 
+    /// Gets the IP address.
+    pub fn addr(&self) -> A {
+        match self {
+            AddrSubnetEither::V4(v4) => v4.addr.into(),
+            AddrSubnetEither::V6(v6) => v6.addr.into(),
+        }
+    }
+
     /// Gets the IP address and prefix.
     #[inline]
     pub fn addr_prefix(&self) -> (A, u8) {
@@ -2520,20 +2640,12 @@ impl<S: IpAddress, A: IpAddressWitness<S> + Copy> From<AddrSubnet<S, A>>
     }
 }
 
-/// An address that can be assigned to an interface.
-///
-/// `InterfaceAddr` upholds the following invariants:
-/// - Addresses must be unicast.
-/// - IPv4 addresses have a defined containing subnet so the broadcast address
-/// is known.
-#[allow(missing_docs)]
-#[derive(Clone, Eq, PartialEq, Debug, Hash)]
-pub enum InterfaceAddr {
-    V4(AddrSubnet<Ipv4Addr>),
-    V6(UnicastAddr<Ipv6Addr>),
-}
-
-impl Display for InterfaceAddr {
+impl<A> Display for AddrSubnetEither<A>
+where
+    A: IpAddrWitness,
+    A::V4: Display,
+    A::V6: Display,
+{
     #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
         match self {
@@ -2543,16 +2655,107 @@ impl Display for InterfaceAddr {
     }
 }
 
-impl From<AddrSubnet<Ipv4Addr>> for InterfaceAddr {
-    fn from(a: AddrSubnet<Ipv4Addr>) -> Self {
-        Self::V4(a)
+/// Marks types that are generic over IP version.
+///
+/// This should be implemented by types that contain a generic parameter
+/// [`I: Ip`](Ip) or [`A: IpAddress`](IpAddress) to allow them to be used with
+/// [`Ip::map_ip`].
+///
+/// Implementations of this trait should generally be themselves generic over
+/// `Ip`. For example:
+/// ```
+/// struct AddrAndSubnet<I: Ip> {
+///   addr: I::Addr,
+///   subnet: Subnet<I::Addr>
+/// }
+///
+/// impl <I: Ip, NewIp: Ip> GenericOverIp<NewIp> for AddrAndSubnet<I> {
+///   type Type = AddrAndSubnet<NewIp>;
+/// }
+/// ```
+pub trait GenericOverIp<NewIp: Ip> {
+    /// The type of `Self` when its IP-generic parameter is replaced with the
+    /// type `NewIp`.
+    type Type;
+}
+
+/// Wrapper type that implements [`GenericOverIp`] with `Type<I: Ip>=Self`.
+///
+/// This can be used to make a compound type implement `GenericOverIp` with
+/// some portion that is invariant over IP version.
+pub struct IpInvariant<T>(pub T);
+
+impl<I: Ip, T> GenericOverIp<I> for IpInvariant<T> {
+    type Type = Self;
+}
+
+impl<I: Ip> GenericOverIp<I> for core::convert::Infallible {
+    type Type = Self;
+}
+
+/// Calls the provided macro with all suffixes of the input.
+macro_rules! for_each_tuple_ {
+        ( $m:ident !! ) => ( $m! { });
+        ( $m:ident !! $h:ident, $($t:ident,)* ) => (
+            $m! { $h $($t)* }
+            for_each_tuple_! { $m !! $($t,)* }
+        );
+    }
+
+/// Calls the provided macro with 0-12 type parameters.
+macro_rules! for_each_tuple {
+    ($m:ident) => {
+        for_each_tuple_! { $m !! A, B, C, D, E, F, G, H, I, J, K, L, }
+    };
+}
+
+/// Implements GenericOverIp for a tuple with the provided generic parameters.
+macro_rules! ip_generic_tuple {
+        () => {
+            impl<I: Ip> GenericOverIp<I> for () {
+                type Type = Self;
+            }
+        };
+        ( $name0:ident $($name:ident)* ) => (
+            impl<P: Ip, $name0: GenericOverIp<P>, $($name: GenericOverIp<P>,)*>
+            GenericOverIp<P> for ($name0, $($name,)*) {
+                type Type = ($name0::Type, $($name::Type,)*);
+            }
+        );
+    }
+
+for_each_tuple!(ip_generic_tuple);
+
+macro_rules! ip_generic {
+    ( $type:ident < $($params:ident),* >) => {
+        impl<IpType: Ip, $($params: GenericOverIp<IpType>),*>
+        GenericOverIp<IpType> for $type<$($params),*> {
+            type Type = $type<$($params::Type),*>;
+        }
+    };
+    ( $type:ident) => {
+        impl<IpType: Ip> GenericOverIp<IpType> for $type {
+            type Type = Self;
+        }
     }
 }
 
-impl From<UnicastAddr<Ipv6Addr>> for InterfaceAddr {
-    fn from(a: UnicastAddr<Ipv6Addr>) -> Self {
-        Self::V6(a)
-    }
+ip_generic!(Option<T>);
+ip_generic!(Result<R, E>);
+ip_generic!(bool);
+
+impl<'s, NewIp: Ip, T: GenericOverIp<NewIp>> GenericOverIp<NewIp> for &'s T
+where
+    T::Type: 's,
+{
+    type Type = &'s T::Type;
+}
+
+impl<'s, NewIp: Ip, T: GenericOverIp<NewIp>> GenericOverIp<NewIp> for &'s mut T
+where
+    T::Type: 's,
+{
+    type Type = &'s mut T::Type;
 }
 
 #[cfg(test)]
@@ -2560,6 +2763,95 @@ mod tests {
     use core::convert::TryInto;
 
     use super::*;
+
+    #[test]
+    fn test_map_ip_associated_constant() {
+        fn get_loopback_address<I: Ip>() -> SpecifiedAddr<I::Addr> {
+            I::map_ip((), |()| Ipv4::LOOPBACK_ADDRESS, |()| Ipv6::LOOPBACK_ADDRESS)
+        }
+
+        assert_eq!(get_loopback_address::<Ipv4>(), Ipv4::LOOPBACK_ADDRESS);
+        assert_eq!(get_loopback_address::<Ipv6>(), Ipv6::LOOPBACK_ADDRESS);
+    }
+
+    #[test]
+    fn test_map_ip_different_behavior() {
+        fn filter_v4<I: Ip>(addr: I::Addr) -> Option<I::Addr> {
+            I::map_ip(addr, |addr| Some(addr), |_addr| None)
+        }
+
+        assert_eq!(filter_v4::<Ipv4>(*Ipv4::LOOPBACK_ADDRESS), Some(*Ipv4::LOOPBACK_ADDRESS));
+        assert_eq!(filter_v4::<Ipv6>(*Ipv6::LOOPBACK_ADDRESS), None);
+    }
+
+    #[test]
+    fn test_map_ip_extension_trait_fn() {
+        trait FakeIpExt: Ip {
+            fn reverse_addr_bytes(a: Self::Addr) -> Self::Addr;
+        }
+
+        impl FakeIpExt for Ipv4 {
+            fn reverse_addr_bytes(a: Self::Addr) -> Self::Addr {
+                let Ipv4Addr(mut bytes) = a;
+                bytes.reverse();
+                Ipv4Addr(bytes)
+            }
+        }
+        impl FakeIpExt for Ipv6 {
+            fn reverse_addr_bytes(a: Self::Addr) -> Self::Addr {
+                let Ipv6Addr(mut bytes) = a;
+                bytes.reverse();
+                Ipv6Addr(bytes)
+            }
+        }
+
+        fn reverse_bytes<A: IpAddress>(addr: A) -> A
+        where
+            A::Version: FakeIpExt,
+        {
+            A::Version::map_ip(addr, Ipv4::reverse_addr_bytes, Ipv6::reverse_addr_bytes)
+        }
+
+        assert_eq!(reverse_bytes(Ipv4Addr([1, 2, 3, 4])), Ipv4Addr([4, 3, 2, 1]));
+        assert_eq!(
+            reverse_bytes(Ipv6Addr([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])),
+            Ipv6Addr([16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1])
+        );
+    }
+
+    #[test]
+    fn test_map_ip_extension_trait_associated_type() {
+        trait FakeIpExt: Ip {
+            type PackedInt;
+        }
+        impl FakeIpExt for Ipv4 {
+            type PackedInt = u32;
+        }
+        impl FakeIpExt for Ipv6 {
+            type PackedInt = u128;
+        }
+
+        #[derive(Debug, PartialEq)]
+        struct Int<T>(T);
+
+        impl<T, I: FakeIpExt> GenericOverIp<I> for Int<T> {
+            type Type = Int<I::PackedInt>;
+        }
+
+        fn from_be_bytes<A: IpAddress>(addr: A) -> Int<<A::Version as FakeIpExt>::PackedInt>
+        where
+            A::Version: FakeIpExt,
+        {
+            A::Version::map_ip(
+                addr,
+                |Ipv4Addr(bytes)| Int(<Ipv4 as FakeIpExt>::PackedInt::from_be_bytes(bytes)),
+                |Ipv6Addr(bytes)| Int(<Ipv6 as FakeIpExt>::PackedInt::from_be_bytes(bytes)),
+            )
+        }
+
+        assert_eq!(from_be_bytes(Ipv4::LOOPBACK_ADDRESS.get()), Int(0x7f000001u32));
+        assert_eq!(from_be_bytes(Ipv6::LOOPBACK_ADDRESS.get()), Int(1u128));
+    }
 
     #[test]
     fn test_loopback_unicast() {
@@ -3078,5 +3370,238 @@ mod tests {
             let converted: net::Ipv6Addr = v6.into();
             assert_eq!(converted, std_v6);
         }
+    }
+}
+
+/// Tests of the [`GenericOverIp`] derive macro.
+#[cfg(test)]
+mod macro_test {
+    use super::*;
+
+    /// No-op function that will only compile if `T::Type<I> = Other`.
+    fn assert_ip_generic_is<T, I, Other>()
+    where
+        I: Ip,
+        T: GenericOverIp<I, Type = Other>,
+    {
+        // Do nothing; this function just serves to assert that the argument
+        // does in fact implement GenericOverIp.
+    }
+
+    macro_rules! assert_ip_generic {
+        ($name:ident, Ip $(,$($param:ident),*)?) => {
+            assert_ip_generic_is::<$name<Ipv4 $(, $($param,)*)?>, Ipv4, $name<Ipv4 $(, $($param,)*)?>>();
+            assert_ip_generic_is::<$name<Ipv4 $(, $($param,)*)?>, Ipv6, $name<Ipv6 $(, $($param,)*)?>>();
+            assert_ip_generic_is::<$name<Ipv6 $(, $($param,)*)?>, Ipv4, $name<Ipv4 $(, $($param,)*)?>>();
+            assert_ip_generic_is::<$name<Ipv6 $(, $($param,)*)?>, Ipv6, $name<Ipv6 $(, $($param,)*)?>>();
+        };
+        ($name:ident, IpAddress $(,$($param:ident),*)?) => {
+            assert_ip_generic_is::<$name<Ipv4Addr $(, $($param,)*)?>, Ipv4, $name<Ipv4Addr $(, $($param,)*)?>>();
+            assert_ip_generic_is::<$name<Ipv4Addr $(, $($param,)*)?>, Ipv6, $name<Ipv6Addr $(, $($param,)*)?>>();
+            assert_ip_generic_is::<$name<Ipv6Addr $(, $($param,)*)?>, Ipv4, $name<Ipv4Addr $(, $($param,)*)?>>();
+            assert_ip_generic_is::<$name<Ipv6Addr $(, $($param,)*)?>, Ipv6, $name<Ipv6Addr $(, $($param,)*)?>>();
+        };
+        ($name:ident $(,$($param:ident),*)?) => {
+            assert_ip_generic_is::<$name<$($($param,)*)?>, Ipv4, $name<$($($param,)*)?>>();
+            assert_ip_generic_is::<$name<$($($param,)*)?>, Ipv6, $name<$($($param,)*)?>>();
+            assert_ip_generic_is::<$name<$($($param,)*)?>, Ipv4, $name<$($($param,)*)?>>();
+            assert_ip_generic_is::<$name<$($($param,)*)?>, Ipv6, $name<$($($param,)*)?>>();
+        };
+    }
+
+    #[test]
+    fn struct_with_ip_version_parameter() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        struct Generic<I: Ip> {
+            addr: I::Addr,
+        }
+
+        assert_ip_generic!(Generic, Ip);
+    }
+
+    #[test]
+    fn struct_with_ip_address_parameter() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        struct Generic<A: IpAddress> {
+            addr: A,
+        }
+
+        assert_ip_generic!(Generic, IpAddress);
+    }
+
+    #[test]
+    fn enum_with_ip_version_parameter() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        enum Generic<I: Ip> {
+            A(I::Addr),
+            B(I::Addr),
+        }
+
+        assert_ip_generic!(Generic, Ip);
+    }
+
+    #[test]
+    fn enum_with_ip_address_parameter() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        enum Generic<A: IpAddress> {
+            A(A),
+            B(A),
+        }
+
+        assert_ip_generic!(Generic, IpAddress);
+    }
+
+    #[test]
+    fn struct_with_ip_version_and_other_parameters() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        struct AddrAndDevice<I: Ip, D> {
+            addr: I::Addr,
+            device: D,
+        }
+        struct Device;
+
+        assert_ip_generic!(AddrAndDevice, Ip, Device);
+    }
+
+    #[test]
+    fn enum_with_ip_version_and_other_parameters() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        enum AddrOrDevice<I: Ip, D> {
+            Addr(I::Addr),
+            Device(D),
+        }
+        struct Device;
+
+        assert_ip_generic!(AddrOrDevice, Ip, Device);
+    }
+
+    #[test]
+    fn struct_with_ip_address_and_other_parameters() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        struct AddrAndDevice<A: IpAddress, D> {
+            addr: A,
+            device: D,
+        }
+        struct Device;
+
+        assert_ip_generic!(AddrAndDevice, IpAddress, Device);
+    }
+
+    #[test]
+    fn enum_with_ip_address_and_other_parameters() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp, Debug, PartialEq)]
+        enum AddrOrDevice<A: IpAddress, D> {
+            Addr(A),
+            Device(D),
+        }
+        struct Device;
+
+        assert_ip_generic!(AddrOrDevice, IpAddress, Device);
+    }
+
+    #[test]
+    fn struct_invariant_over_ip() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        struct Invariant(usize);
+
+        assert_ip_generic!(Invariant);
+    }
+
+    #[test]
+    fn enum_invariant_over_ip() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        enum Invariant {
+            Usize(usize),
+        }
+
+        assert_ip_generic!(Invariant);
+    }
+
+    #[test]
+    fn struct_invariant_over_ip_with_other_params() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        struct Invariant<B, C, D>(B, C, D);
+
+        assert_ip_generic!(Invariant, usize, bool, char);
+    }
+
+    #[test]
+    fn enum_invariant_over_ip_with_other_params() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        enum Invariant<A, B, C> {
+            A(A),
+            B(B),
+            C(C),
+        }
+
+        assert_ip_generic!(Invariant, usize, bool, char);
+    }
+
+    #[test]
+    fn struct_with_ip_version_extension_parameter() {
+        trait FakeIpExt: Ip {
+            type Associated;
+        }
+        impl FakeIpExt for Ipv4 {
+            type Associated = u8;
+        }
+        impl FakeIpExt for Ipv6 {
+            type Associated = u16;
+        }
+
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        struct Generic<I: Ip + FakeIpExt> {
+            field: I::Associated,
+        }
+
+        assert_ip_generic!(Generic, Ip);
+    }
+
+    #[test]
+    fn struct_with_ip_address_extension_parameter() {
+        trait FakeIpAddressExt: IpAddress {
+            type Associated;
+        }
+        impl FakeIpAddressExt for Ipv4Addr {
+            type Associated = u8;
+        }
+        impl FakeIpAddressExt for Ipv6Addr {
+            type Associated = u16;
+        }
+
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        struct Generic<A: IpAddress + FakeIpAddressExt> {
+            field: A::Associated,
+        }
+
+        assert_ip_generic!(Generic, IpAddress);
+    }
+
+    #[test]
+    fn type_with_lifetime_and_ip_parameter() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        struct Generic<'a, I: Ip> {
+            field: &'a I::Addr,
+        }
+
+        assert_ip_generic_is::<Generic<'static, Ipv4>, Ipv4, Generic<'static, Ipv4>>();
+        assert_ip_generic_is::<Generic<'static, Ipv4>, Ipv6, Generic<'static, Ipv6>>();
+        assert_ip_generic_is::<Generic<'static, Ipv6>, Ipv4, Generic<'static, Ipv4>>();
+        assert_ip_generic_is::<Generic<'static, Ipv6>, Ipv6, Generic<'static, Ipv6>>();
     }
 }

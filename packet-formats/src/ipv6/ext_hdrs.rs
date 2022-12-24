@@ -8,21 +8,21 @@
 //!
 //! [RFC 8200 Section 4]: https://datatracker.ietf.org/doc/html/rfc8200#section-4
 
-use core::convert::TryFrom;
+use core::convert::{Infallible as Never, TryFrom};
 use core::marker::PhantomData;
 
 use packet::records::options::{
-    AlignedOptionBuilder, LengthEncoding, OptionBuilder, OptionLayout, OptionParseLayout,
+    AlignedOptionBuilder, LengthEncoding, OptionBuilder, OptionLayout, OptionParseErr,
+    OptionParseLayout,
 };
 use packet::records::{
     ParsedRecord, RecordParseResult, Records, RecordsContext, RecordsImpl, RecordsImplLayout,
     RecordsRawImpl,
 };
 use packet::{BufferView, BufferViewMut};
-use zerocopy::byteorder::{ByteOrder, NetworkEndian};
+use zerocopy::byteorder::{network_endian::U16, ByteOrder, NetworkEndian};
 
 use crate::ip::{IpProto, Ipv6ExtHdrType, Ipv6Proto};
-use crate::U16;
 
 /// The length of an IPv6 Fragment Extension Header.
 pub(crate) const IPV6_FRAGMENT_EXT_HDR_LEN: usize = 8;
@@ -85,6 +85,12 @@ pub(super) enum Ipv6ExtensionHeaderParsingError {
     MalformedData,
 }
 
+impl From<Never> for Ipv6ExtensionHeaderParsingError {
+    fn from(err: Never) -> Ipv6ExtensionHeaderParsingError {
+        match err {}
+    }
+}
+
 /// Context that gets passed around when parsing IPv6 Extension Headers.
 #[derive(Debug, Clone)]
 pub(super) struct Ipv6ExtensionHeaderParsingContext {
@@ -117,10 +123,16 @@ impl Ipv6ExtensionHeaderParsingContext {
 }
 
 impl RecordsContext for Ipv6ExtensionHeaderParsingContext {
+    type Counter = ();
+
     fn clone_for_iter(&self) -> Self {
         let mut ret = self.clone();
         ret.iter = true;
         ret
+    }
+
+    fn counter_mut(&mut self) -> &mut () {
+        get_empty_tuple_mut_ref()
     }
 }
 
@@ -369,7 +381,30 @@ impl<'a> RecordsImpl<'a> for Ipv6ExtensionHeaderImpl {
             Ipv6ExtHdrType::Routing => Self::parse_routing(data, context),
             Ipv6ExtHdrType::Fragment => Self::parse_fragment(data, context),
             Ipv6ExtHdrType::DestinationOptions => Self::parse_destination_options(data, context),
-            _ => {
+            Ipv6ExtHdrType::EncapsulatingSecurityPayload | Ipv6ExtHdrType::Authentication => {
+                // We don't implement these extension header types.
+                //
+                // Per RFC 2460:
+                //   If, as a result of processing a header, a node is required to
+                //   proceed to the next header but the Next Header value in the
+                //   current header is unrecognized by the node, it should discard
+                //   the packet and send an ICMP Parameter Problem message to the
+                //   source of the packet, with an ICMP Code value of 1
+                //   ("unrecognized Next Header type encountered") and the ICMP
+                //   Pointer field containing the offset of the unrecognized value
+                //   within the original packet.
+                Err(Ipv6ExtensionHeaderParsingError::UnrecognizedNextHeader {
+                    // TODO(https://fxbug.dev/78130): When overhauling packet
+                    // validation, return the right values for `pointer` and
+                    // `header_len`.
+                    pointer: u32::MAX,
+                    header_len: 0,
+                    // This is false because of the "should" in the quoted RFC
+                    // text.
+                    must_send_icmp: false,
+                })
+            }
+            Ipv6ExtHdrType::Other(_) => {
                 if is_valid_next_header_upper_layer(expected_hdr) {
                     // Stop parsing extension headers when we find a Next Header value
                     // for a higher level protocol.
@@ -545,7 +580,7 @@ impl OptionLayout for HopByHopOptionsImpl {
 }
 
 impl OptionParseLayout for HopByHopOptionsImpl {
-    type Error = ();
+    type Error = OptionParseErr;
     const END_OF_OPTIONS: Option<u8> = Some(0);
     const NOP: Option<u8> = Some(1);
 }
@@ -794,7 +829,13 @@ impl<C: Sized + Clone + Default> ExtensionHeaderOptionContext<C> {
     }
 }
 
-impl<C: Sized + Clone> RecordsContext for ExtensionHeaderOptionContext<C> {}
+impl<C: Sized + Clone> RecordsContext for ExtensionHeaderOptionContext<C> {
+    type Counter = ();
+
+    fn counter_mut(&mut self) -> &mut () {
+        get_empty_tuple_mut_ref()
+    }
+}
 
 /// Basic associated types required by `ExtensionHeaderOptionDataImpl`.
 pub(super) trait ExtensionHeaderOptionDataImplLayout {
@@ -984,6 +1025,12 @@ pub(crate) enum ExtensionHeaderOptionParsingError {
     BufferExhausted,
 }
 
+impl From<Never> for ExtensionHeaderOptionParsingError {
+    fn from(err: Never) -> ExtensionHeaderOptionParsingError {
+        match err {}
+    }
+}
+
 /// Action to take when an unrecognized option type is encountered.
 ///
 /// `ExtensionHeaderOptionAction` is an action that MUST be taken (according
@@ -1142,6 +1189,12 @@ fn ext_hdr_opt_err_to_ext_hdr_err(
             Ipv6ExtensionHeaderParsingError::BufferExhausted
         }
     }
+}
+
+fn get_empty_tuple_mut_ref<'a>() -> &'a mut () {
+    // This is a hack since `&mut ()` is invalid.
+    let bytes: &mut [u8] = &mut [];
+    zerocopy::LayoutVerified::<_, ()>::new_unaligned(bytes).unwrap().into_mut()
 }
 
 #[cfg(test)]

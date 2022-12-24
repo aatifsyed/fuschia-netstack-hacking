@@ -9,11 +9,13 @@ use core::num::NonZeroU8;
 use core::time::Duration;
 
 use net_types::ip::{Ipv6, Ipv6Addr};
-use zerocopy::{AsBytes, ByteSlice, FromBytes, Unaligned};
+use zerocopy::{
+    byteorder::network_endian::{U16, U32},
+    AsBytes, ByteSlice, FromBytes, Unaligned,
+};
 
 use crate::icmp::{IcmpIpExt, IcmpPacket, IcmpUnusedCode};
 use crate::utils::NonZeroDuration;
-use crate::{U16, U32};
 
 /// An ICMPv6 packet with an NDP message.
 #[allow(missing_docs)]
@@ -24,6 +26,59 @@ pub enum NdpPacket<B: ByteSlice> {
     NeighborSolicitation(IcmpPacket<Ipv6, B, NeighborSolicitation>),
     NeighborAdvertisement(IcmpPacket<Ipv6, B, NeighborAdvertisement>),
     Redirect(IcmpPacket<Ipv6, B, Redirect>),
+}
+
+/// A non-zero lifetime conveyed through NDP.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+pub enum NonZeroNdpLifetime {
+    /// A finite lifetime greater than zero.
+    ///
+    /// Note that the finite lifetime is not statically guaranteed to be less
+    /// than the infinite value representation of a field. E.g. for Prefix
+    /// Information option lifetime 32-bit fields, infinity is represented as
+    /// all 1s but it is possible for this variant to hold a value representing
+    /// X seconds where X is >= 2^32.
+    Finite(NonZeroDuration),
+
+    /// An infinite lifetime.
+    Infinite,
+}
+
+impl NonZeroNdpLifetime {
+    /// Returns a `Some(NonZeroNdpLifetime)` if the passed lifetime is non-zero;
+    /// otherwise `None`.
+    pub fn from_u32_with_infinite(lifetime: u32) -> Option<NonZeroNdpLifetime> {
+        // Per RFC 4861 section 4.6.2,
+        //
+        //   Valid Lifetime
+        //                  32-bit unsigned integer.  The length of time in
+        //                  seconds (relative to the time the packet is sent)
+        //                  that the prefix is valid for the purpose of on-link
+        //                  determination.  A value of all one bits
+        //                  (0xffffffff) represents infinity.  The Valid
+        //                  Lifetime is also used by [ADDRCONF].
+        //
+        //   Preferred Lifetime
+        //                  32-bit unsigned integer.  The length of time in
+        //                  seconds (relative to the time the packet is sent)
+        //                  that addresses generated from the prefix via
+        //                  stateless address autoconfiguration remain
+        //                  preferred [ADDRCONF].  A value of all one bits
+        //                  (0xffffffff) represents infinity.  See [ADDRCONF].
+        match lifetime {
+            u32::MAX => Some(NonZeroNdpLifetime::Infinite),
+            finite => NonZeroDuration::new(Duration::from_secs(finite.into()))
+                .map(NonZeroNdpLifetime::Finite),
+        }
+    }
+
+    /// Returns the minimum finite duration.
+    pub fn min_finite_duration(self, other: NonZeroDuration) -> NonZeroDuration {
+        match self {
+            NonZeroNdpLifetime::Finite(lifetime) => core::cmp::min(lifetime, other),
+            NonZeroNdpLifetime::Infinite => other,
+        }
+    }
 }
 
 /// A records parser for NDP options.
@@ -397,14 +452,14 @@ pub mod options {
     use net_types::UnicastAddress;
     use nonzero_ext::nonzero;
     use packet::records::options::{
-        LengthEncoding, OptionBuilder, OptionLayout, OptionParseLayout, OptionsImpl,
+        LengthEncoding, OptionBuilder, OptionLayout, OptionParseErr, OptionParseLayout, OptionsImpl,
     };
     use packet::BufferView as _;
-    use zerocopy::byteorder::{ByteOrder, NetworkEndian};
+    use zerocopy::byteorder::{network_endian::U32, ByteOrder, NetworkEndian};
     use zerocopy::{AsBytes, FromBytes, LayoutVerified, Unaligned};
 
+    use super::NonZeroNdpLifetime;
     use crate::utils::NonZeroDuration;
-    use crate::U32;
 
     /// A value representing an infinite lifetime for various NDP options'
     /// lifetime fields.
@@ -732,19 +787,19 @@ pub mod options {
         /// Get the length of time (relative to the time the packet is sent) that
         /// the prefix is valid for the purpose of on-link determination and SLAAC.
         ///
-        /// A value of [`INFINITE_LIFETIME`] represents infinity; a value of `None`
-        /// means that the prefix must no longer be used for on-link determination.
-        pub fn valid_lifetime(&self) -> Option<NonZeroDuration> {
-            NonZeroDuration::new(Duration::from_secs(self.valid_lifetime.get().into()))
+        /// `None` indicates that the prefix has no valid lifetime and should
+        /// not be considered valid.
+        pub fn valid_lifetime(&self) -> Option<NonZeroNdpLifetime> {
+            NonZeroNdpLifetime::from_u32_with_infinite(self.valid_lifetime.get())
         }
 
         /// Get the length of time (relative to the time the packet is sent) that
         /// addresses generated from the prefix via SLAAC remains preferred.
         ///
-        /// A value of [`INFINITE_LIFETIME`] represents infinity; a value of `None`
-        /// means that the prefix should be immediately deprecated.
-        pub fn preferred_lifetime(&self) -> Option<NonZeroDuration> {
-            NonZeroDuration::new(Duration::from_secs(self.preferred_lifetime.get().into()))
+        /// `None` indicates that the prefix has no preferred lifetime and
+        /// should not be considered preferred.
+        pub fn preferred_lifetime(&self) -> Option<NonZeroNdpLifetime> {
+            NonZeroNdpLifetime::from_u32_with_infinite(self.preferred_lifetime.get())
         }
 
         /// An IPv6 address or a prefix of an IPv6 address.
@@ -807,7 +862,7 @@ pub mod options {
 
     impl OptionParseLayout for NdpOptionsImpl {
         // TODO(fxbug.dev/52288): Return more verbose logs on parsing errors.
-        type Error = ();
+        type Error = OptionParseErr;
 
         // NDP options don't have END_OF_OPTIONS or NOP.
         const END_OF_OPTIONS: Option<u8> = None;
@@ -817,7 +872,7 @@ pub mod options {
     impl<'a> OptionsImpl<'a> for NdpOptionsImpl {
         type Option = NdpOption<'a>;
 
-        fn parse(kind: u8, mut data: &'a [u8]) -> Result<Option<NdpOption<'a>>, ()> {
+        fn parse(kind: u8, mut data: &'a [u8]) -> Result<Option<NdpOption<'a>>, OptionParseErr> {
             let kind = if let Ok(k) = NdpOptionType::try_from(kind) {
                 k
             } else {
@@ -828,7 +883,8 @@ pub mod options {
                 NdpOptionType::SourceLinkLayerAddress => NdpOption::SourceLinkLayerAddress(data),
                 NdpOptionType::TargetLinkLayerAddress => NdpOption::TargetLinkLayerAddress(data),
                 NdpOptionType::PrefixInformation => {
-                    let data = LayoutVerified::<_, PrefixInformation>::new(data).ok_or(())?;
+                    let data =
+                        LayoutVerified::<_, PrefixInformation>::new(data).ok_or(OptionParseErr)?;
                     NdpOption::PrefixInformation(data.into_ref())
                 }
                 NdpOptionType::RedirectedHeader => NdpOption::RedirectedHeader {
@@ -839,7 +895,7 @@ pub mod options {
                 )),
                 NdpOptionType::RecursiveDnsServer => {
                     if data.len() < MIN_RECURSIVE_DNS_SERVER_OPTION_LENGTH {
-                        return Err(());
+                        return Err(OptionParseErr);
                     }
 
                     // Skip the reserved bytes which immediately follow the kind and length
@@ -850,17 +906,17 @@ pub mod options {
                     // As per RFC 8106 section 5.1, the 32 bit lifetime field immediately
                     // follows the reserved field.
                     let (lifetime, data) =
-                        LayoutVerified::<_, U32>::new_from_prefix(data).ok_or(())?;
+                        LayoutVerified::<_, U32>::new_from_prefix(data).ok_or(OptionParseErr)?;
 
                     // As per RFC 8106 section 5.1, the list of addresses immediately
                     // follows the lifetime field.
                     let addresses = LayoutVerified::<_, [Ipv6Addr]>::new_slice_unaligned(data)
-                        .ok_or(())?
+                        .ok_or(OptionParseErr)?
                         .into_slice();
 
                     // As per RFC 8106 section 5.3.1, the addresses should all be unicast.
                     if !addresses.iter().all(UnicastAddress::is_unicast) {
-                        return Err(());
+                        return Err(OptionParseErr);
                     }
 
                     NdpOption::RecursiveDnsServer(RecursiveDnsServer::new(
@@ -881,13 +937,14 @@ pub mod options {
 
                     let mut buf = &mut data;
 
-                    let fixed = buf.take_obj_front::<RouteInfoFixed>().ok_or(())?;
+                    let fixed = buf.take_obj_front::<RouteInfoFixed>().ok_or(OptionParseErr)?;
 
                     // The preference is preceded and followed by two 3-bit reserved fields.
                     let preference = super::RoutePreference::try_from(
                         (fixed.preference_raw & ROUTE_INFORMATION_PREFERENCE_MASK)
                             >> ROUTE_INFORMATION_PREFERENCE_RESERVED_BITS_RIGHT,
-                    )?;
+                    )
+                    .map_err(|()| OptionParseErr)?;
 
                     // We need to check whether the remaining buffer length storing the prefix is
                     // valid.
@@ -902,14 +959,14 @@ pub mod options {
                     // (included) octets i.e. 0 to 16 bytes.
                     let buf_len = buf.len();
                     if buf_len % OPTION_BYTES_PER_LENGTH_UNIT != 0 {
-                        return Err(());
+                        return Err(OptionParseErr);
                     }
                     let length = buf_len / OPTION_BYTES_PER_LENGTH_UNIT;
                     match (fixed.prefix_length, length) {
                         (65..=128, 2) => {}
                         (1..=64, 1 | 2) => {}
                         (0, 0 | 1 | 2) => {}
-                        _ => return Err(()),
+                        _ => return Err(OptionParseErr),
                     }
 
                     let mut prefix_buf = [0; 16];
@@ -918,7 +975,7 @@ pub mod options {
                     let prefix = Ipv6Addr::from_bytes(prefix_buf);
 
                     NdpOption::RouteInformation(RouteInformation::new(
-                        Subnet::new(prefix, fixed.prefix_length).map_err(|_| ())?,
+                        Subnet::new(prefix, fixed.prefix_length).map_err(|_| OptionParseErr)?,
                         fixed.route_lifetime_seconds.get(),
                         preference,
                     ))
@@ -1334,15 +1391,15 @@ mod tests {
                     );
                     assert_eq!(
                         info.valid_lifetime(),
-                        NonZeroDuration::new(Duration::from_secs(
-                            PREFIX_INFO_VALID_LIFETIME_SECONDS.into()
-                        ))
+                        NonZeroNdpLifetime::from_u32_with_infinite(
+                            PREFIX_INFO_VALID_LIFETIME_SECONDS
+                        )
                     );
                     assert_eq!(
                         info.preferred_lifetime(),
-                        NonZeroDuration::new(Duration::from_secs(
-                            PREFIX_INFO_PREFERRED_LIFETIME_SECONDS.into()
-                        ))
+                        NonZeroNdpLifetime::from_u32_with_infinite(
+                            PREFIX_INFO_PREFERRED_LIFETIME_SECONDS
+                        )
                     );
                     assert_eq!(info.prefix_length(), PREFIX_INFO_PREFIX.prefix());
                     assert_eq!(info.prefix(), &PREFIX_INFO_PREFIX.network());
@@ -1660,5 +1717,59 @@ mod tests {
         expected[8..].copy_from_slice(prefix.bytes());
 
         assert_eq!(serialized.as_ref(), &expected[..expected_option_length.into()]);
+    }
+
+    #[test_case(0, None)]
+    #[test_case(
+        1,
+        Some(NonZeroNdpLifetime::Finite(NonZeroDuration::new(
+            Duration::from_secs(1),
+        ).unwrap()))
+    )]
+    #[test_case(
+        u32::MAX - 1,
+        Some(NonZeroNdpLifetime::Finite(NonZeroDuration::new(
+            Duration::from_secs(u64::from(u32::MAX) - 1),
+        ).unwrap()))
+    )]
+    #[test_case(u32::MAX, Some(NonZeroNdpLifetime::Infinite))]
+    fn non_zero_ndp_lifetime_non_zero_or_max_u32_from_u32_with_infinite(
+        t: u32,
+        expected: Option<NonZeroNdpLifetime>,
+    ) {
+        assert_eq!(NonZeroNdpLifetime::from_u32_with_infinite(t), expected)
+    }
+
+    const MIN_NON_ZERO_DURATION: Duration = Duration::new(0, 1);
+    #[test_case(
+        NonZeroNdpLifetime::Infinite,
+        NonZeroDuration::new(MIN_NON_ZERO_DURATION).unwrap(),
+        NonZeroDuration::new(MIN_NON_ZERO_DURATION).unwrap()
+    )]
+    #[test_case(
+        NonZeroNdpLifetime::Infinite,
+        NonZeroDuration::new(Duration::MAX).unwrap(),
+        NonZeroDuration::new(Duration::MAX).unwrap()
+    )]
+    #[test_case(
+        NonZeroNdpLifetime::Finite(NonZeroDuration::new(
+            Duration::from_secs(2)).unwrap()
+        ),
+        NonZeroDuration::new(Duration::from_secs(1)).unwrap(),
+        NonZeroDuration::new(Duration::from_secs(1)).unwrap()
+    )]
+    #[test_case(
+        NonZeroNdpLifetime::Finite(NonZeroDuration::new(
+            Duration::from_secs(3)).unwrap()
+        ),
+        NonZeroDuration::new(Duration::from_secs(4)).unwrap(),
+        NonZeroDuration::new(Duration::from_secs(3)).unwrap()
+    )]
+    fn non_zero_ndp_lifetime_min_finite_duration(
+        lifetime: NonZeroNdpLifetime,
+        duration: NonZeroDuration,
+        expected: NonZeroDuration,
+    ) {
+        assert_eq!(lifetime.min_finite_duration(duration), expected)
     }
 }

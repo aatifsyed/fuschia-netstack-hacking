@@ -24,7 +24,10 @@ use packet::{
     NestedPacketBuilder, PacketBuilder, PacketConstraints, ParsablePacket, ParseMetadata,
     SerializeBuffer, SerializeError, Serializer, TargetBuffer,
 };
-use zerocopy::{AsBytes, ByteSlice, ByteSliceMut, FromBytes, LayoutVerified, Unaligned};
+use zerocopy::{
+    byteorder::network_endian::U16, AsBytes, ByteSlice, ByteSliceMut, FromBytes, LayoutVerified,
+    Unaligned,
+};
 
 use crate::error::{IpParseError, IpParseResult, ParseError};
 use crate::ip::{
@@ -33,7 +36,6 @@ use crate::ip::{
 use crate::ipv6::Ipv6PacketBuilder;
 use crate::tcp::{TcpParseArgs, TcpSegment};
 use crate::udp::{UdpPacket, UdpParseArgs};
-use crate::U16;
 
 pub(crate) use self::inner::IPV4_MIN_HDR_LEN;
 use self::options::{Ipv4Option, Ipv4OptionsImpl};
@@ -274,7 +276,7 @@ impl<B: ByteSlice> FromRaw<Ipv4PacketRaw<B>, ()> for Ipv4Packet<B> {
                 return debug_err!(Err(ParseError::Format.into()), "Incomplete options");
             }
             MaybeParsed::Complete(unchecked) => Options::try_from_raw(unchecked)
-                .map_err(|e| debug_err!(ParseError::Format, "malformed options: {:?}", e))?,
+                .map_err(|e| debug_err!(e, "malformed options: {:?}", e))?,
         };
 
         if hdr_prefix.version() != 4 {
@@ -933,11 +935,11 @@ pub(crate) fn reassemble_fragmented_packet<
 
 /// Parsing and serialization of IPv4 options.
 pub mod options {
-    use packet::records::options::{OptionBuilder, OptionLayout, OptionParseLayout, OptionsImpl};
+    use packet::records::options::{
+        OptionBuilder, OptionLayout, OptionParseErr, OptionParseLayout, OptionsImpl,
+    };
     use packet::BufferViewMut;
-    use zerocopy::byteorder::{ByteOrder, NetworkEndian};
-
-    use crate::U16;
+    use zerocopy::byteorder::{network_endian::U16, ByteOrder, NetworkEndian};
 
     const OPTION_KIND_EOL: u8 = 0;
     const OPTION_KIND_NOP: u8 = 1;
@@ -1001,7 +1003,7 @@ pub mod options {
     }
 
     impl OptionParseLayout for Ipv4OptionsImpl {
-        type Error = ();
+        type Error = OptionParseErr;
         const END_OF_OPTIONS: Option<u8> = Some(0);
         const NOP: Option<u8> = Some(1);
     }
@@ -1009,7 +1011,7 @@ pub mod options {
     impl<'a> OptionsImpl<'a> for Ipv4OptionsImpl {
         type Option = Ipv4Option<'a>;
 
-        fn parse(kind: u8, data: &'a [u8]) -> Result<Option<Ipv4Option<'a>>, ()> {
+        fn parse(kind: u8, data: &'a [u8]) -> Result<Option<Ipv4Option<'a>>, OptionParseErr> {
             let copied = kind & (1 << 7) > 0;
             match kind {
                 self::OPTION_KIND_EOL | self::OPTION_KIND_NOP => {
@@ -1024,12 +1026,12 @@ pub mod options {
                             },
                         }))
                     } else {
-                        Err(())
+                        Err(OptionParseErr)
                     }
                 }
                 kind => {
                     if data.len() > 38 {
-                        Err(())
+                        Err(OptionParseErr)
                     } else {
                         Ok(Some(Ipv4Option {
                             copied,
@@ -1403,7 +1405,7 @@ mod tests {
 
     #[test]
     fn test_partial_parsing() {
-        use std::ops::Deref as _;
+        use core::ops::Deref as _;
 
         // Try something with only the header, but that would have a larger
         // body:
@@ -1471,7 +1473,7 @@ mod tests {
     fn create_tcp_ipv4_and_ipv6_pkt(
     ) -> (packet::Either<EmptyBuf, Buf<Vec<u8>>>, packet::Either<EmptyBuf, Buf<Vec<u8>>>) {
         use crate::tcp::TcpSegmentBuilder;
-        use std::num::NonZeroU16;
+        use core::num::NonZeroU16;
 
         let tcp_src_port: NonZeroU16 = NonZeroU16::new(20).unwrap();
         let tcp_dst_port: NonZeroU16 = NonZeroU16::new(30).unwrap();
@@ -1559,7 +1561,7 @@ mod tests {
     fn create_udp_ipv4_and_ipv6_pkt(
     ) -> (packet::Either<EmptyBuf, Buf<Vec<u8>>>, packet::Either<EmptyBuf, Buf<Vec<u8>>>) {
         use crate::udp::UdpPacketBuilder;
-        use std::num::NonZeroU16;
+        use core::num::NonZeroU16;
 
         let udp_src_port: NonZeroU16 = NonZeroU16::new(35000).unwrap();
         let udp_dst_port: NonZeroU16 = NonZeroU16::new(53).unwrap();

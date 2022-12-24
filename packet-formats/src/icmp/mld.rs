@@ -16,11 +16,12 @@ use core::time::Duration;
 use net_types::ip::{Ipv6, Ipv6Addr};
 use net_types::MulticastAddr;
 use packet::serialize::InnerPacketBuilder;
-use zerocopy::{AsBytes, ByteSlice, FromBytes, LayoutVerified, Unaligned};
+use zerocopy::{
+    byteorder::network_endian::U16, AsBytes, ByteSlice, FromBytes, LayoutVerified, Unaligned,
+};
 
 use crate::error::{ParseError, ParseResult};
 use crate::icmp::{IcmpIpExt, IcmpMessage, IcmpPacket, IcmpUnusedCode, MessageBody};
-use crate::U16;
 
 /// An ICMPv6 packet with an MLD message.
 #[allow(missing_docs)]
@@ -241,8 +242,8 @@ impl<M: Mldv1MessageType> InnerPacketBuilder for Mldv1MessageBuilder<M> {
 
 #[cfg(test)]
 mod tests {
-    use std::convert::TryInto;
-    use std::fmt::Debug;
+    use core::convert::TryInto;
+    use core::fmt::Debug;
 
     use packet::{InnerPacketBuilder, ParseBuffer, Serializer};
 

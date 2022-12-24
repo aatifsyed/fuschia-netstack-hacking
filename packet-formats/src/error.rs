@@ -4,11 +4,14 @@
 
 //! Custom error types for the packet formats.
 
-use net_types::ip::{Ip, IpAddress};
+use core::convert::Infallible as Never;
+
+use net_types::ip::IpAddress;
 use net_types::MulticastAddress;
+use packet::records::{options::OptionParseErr, TooFewRecordsErr};
 use thiserror::Error;
 
-use crate::icmp::IcmpIpTypes;
+use crate::icmp::IcmpIpExt;
 
 /// Results returned from parsing functions in the netstack.
 pub type ParseResult<T> = core::result::Result<T, ParseError>;
@@ -31,6 +34,24 @@ pub enum ParseError {
     /// Packet is not formatted properly.
     #[error("Packet is not formatted properly")]
     Format,
+}
+
+impl From<Never> for ParseError {
+    fn from(err: Never) -> ParseError {
+        match err {}
+    }
+}
+
+impl From<TooFewRecordsErr> for ParseError {
+    fn from(TooFewRecordsErr: TooFewRecordsErr) -> ParseError {
+        ParseError::Format
+    }
+}
+
+impl From<OptionParseErr> for ParseError {
+    fn from(OptionParseErr: OptionParseErr) -> ParseError {
+        ParseError::Format
+    }
 }
 
 /// Action to take when an IP node fails to parse a received IP packet.
@@ -93,7 +114,7 @@ impl IpParseErrorAction {
 /// Error type for IP packet parsing.
 #[allow(missing_docs)]
 #[derive(Error, Debug, PartialEq)]
-pub enum IpParseError<I: IcmpIpTypes> {
+pub enum IpParseError<I: IcmpIpExt> {
     #[error("Parsing Error")]
     Parse { error: ParseError },
     /// For errors where an ICMP Parameter Problem error needs to be sent to the
@@ -139,9 +160,15 @@ pub enum IpParseError<I: IcmpIpTypes> {
     },
 }
 
-impl<I: Ip> From<ParseError> for IpParseError<I> {
+impl<I: IcmpIpExt> From<ParseError> for IpParseError<I> {
     fn from(error: ParseError) -> Self {
         IpParseError::Parse { error }
+    }
+}
+
+impl<I: IcmpIpExt> From<OptionParseErr> for IpParseError<I> {
+    fn from(error: OptionParseErr) -> Self {
+        IpParseError::Parse { error: error.into() }
     }
 }
 
