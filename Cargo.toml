@@ -1,3 +1,10 @@
 [workspace]
 
-members = ["packet", "packet-formats", "fakestd", "net-types", "explicit"]
+members = [
+    "packet",
+    "packet-formats",
+    "fakestd",
+    "net-types",
+    "explicit",
+    "net-types-macros",
+]

@@ -16,7 +16,7 @@ net-types = { path = "../net-types" }
 nonzero_ext = "0.3.0"
 packet = { path = "../packet" }
 thiserror = "1.0.30"
-zerocopy = "0.6.1"
+zerocopy = "0.7.0-alpha.2"
 
 [dev-dependencies]
 assert_matches = "1.5.0"
