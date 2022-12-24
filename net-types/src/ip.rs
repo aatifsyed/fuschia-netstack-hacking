@@ -334,6 +334,7 @@ pub trait Ip:
     /// consider the following:
     ///
     /// ```
+    /// use net_types::ip::{Ip, Ipv4Addr, Ipv6Addr};
     /// // Swaps the order of the addresses only if `I=Ipv4`.
     /// fn swap_only_if_ipv4<I: Ip>(addrs: (I::Addr, I::Addr)) -> (I::Addr, I::Addr) {
     ///    I::map_ip::<(I::Addr, I::Addr), (I::Addr, I::Addr)>(
@@ -2692,6 +2693,7 @@ where
 /// Implementations of this trait should generally be themselves generic over
 /// `Ip`. For example:
 /// ```
+/// use net_types::ip::{Ip, GenericOverIp, Subnet};
 /// struct AddrAndSubnet<I: Ip> {
 ///   addr: I::Addr,
 ///   subnet: Subnet<I::Addr>
