@@ -1,10 +1,11 @@
 [workspace]
 
+# see also download.bash::folder_src_path
 members = [
-    "packet",
-    "packet-formats",
-    "fakestd",
-    "net-types",
     "explicit",
+    "fakestd",
     "net-types-macros",
+    "net-types",
+    "packet-formats",
+    "packet",
 ]
