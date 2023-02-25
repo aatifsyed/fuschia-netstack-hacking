@@ -2,8 +2,8 @@
 set -o errexit -o xtrace -o pipefail -o nounset
 
 # See https://fuchsia.googlesource.com/fuchsia/+/refs/heads/main
-#when=refs/heads/main
-when=ccd71c961977b58cd3cdff0a478795b1d5737519 # Sat Dec 24 15:20:51 2022 +0000
+# when=refs/heads/main
+when=ce7e7275a87db712e058487a906a927b2baedac3 # Sat Feb 25 01:04:39 2023 +0000
 
 declare -A folder_src_path
 folder_src_path=(

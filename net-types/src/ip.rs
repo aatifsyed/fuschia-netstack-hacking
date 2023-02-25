@@ -209,6 +209,30 @@ impl IpVersion {
     }
 }
 
+/// The maximum transmit unit, i.e., the maximum size of an entire IP packet
+/// one link can transmit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Mtu(u32);
+
+impl Mtu {
+    /// Creates MTU from the maximum size of an entire IP packet in bytes.
+    pub const fn new(mtu: u32) -> Self {
+        Self(mtu)
+    }
+
+    /// Gets the numeric value of the MTU.
+    pub const fn get(&self) -> u32 {
+        let Self(mtu) = self;
+        *mtu
+    }
+}
+
+impl From<Mtu> for u32 {
+    fn from(Mtu(mtu): Mtu) -> Self {
+        mtu
+    }
+}
+
 /// A trait for IP protocol versions.
 ///
 /// `Ip` encapsulates the details of a version of the IP protocol. It includes a
@@ -286,7 +310,7 @@ pub trait Ip:
     /// transmission unit (MTU) of at least this many bytes. This MTU applies to
     /// the size of an IP packet, and does not include any extra bytes used by
     /// encapsulating packets (Ethernet frames, GRE packets, etc).
-    const MINIMUM_LINK_MTU: u16;
+    const MINIMUM_LINK_MTU: Mtu;
 
     /// The address type for this IP version.
     ///
@@ -310,7 +334,6 @@ pub trait Ip:
     /// consider the following:
     ///
     /// ```
-    /// use net_types::ip::{Ip, Ipv4Addr, Ipv6Addr};
     /// // Swaps the order of the addresses only if `I=Ipv4`.
     /// fn swap_only_if_ipv4<I: Ip>(addrs: (I::Addr, I::Addr)) -> (I::Addr, I::Addr) {
     ///    I::map_ip::<(I::Addr, I::Addr), (I::Addr, I::Addr)>(
@@ -391,7 +414,7 @@ impl Ip for Ipv4 {
     /// forward a datagram of 68 octets without further fragmentation."
     ///
     /// [RFC 791 Section 3.2]: https://tools.ietf.org/html/rfc791#section-3.2
-    const MINIMUM_LINK_MTU: u16 = 68;
+    const MINIMUM_LINK_MTU: Mtu = Mtu(68);
     type Addr = Ipv4Addr;
 
     fn map_ip<
@@ -547,7 +570,7 @@ impl Ip for Ipv6 {
     /// > below IPv6.
     ///
     /// [RFC 8200 Section 5]: https://tools.ietf.org/html/rfc8200#section-5
-    const MINIMUM_LINK_MTU: u16 = 1280;
+    const MINIMUM_LINK_MTU: Mtu = Mtu(1280);
     type Addr = Ipv6Addr;
 
     fn map_ip<
@@ -2305,6 +2328,10 @@ impl<A: IpAddress> Debug for Subnet<A> {
     }
 }
 
+impl<A, I: Ip> GenericOverIp<I> for Subnet<A> {
+    type Type = Subnet<I::Addr>;
+}
+
 /// An IPv4 subnet or an IPv6 subnet.
 ///
 /// `SubnetEither` is an enum of [`Subnet<Ipv4Addr>`] and `Subnet<Ipv6Addr>`.
@@ -2665,7 +2692,6 @@ where
 /// Implementations of this trait should generally be themselves generic over
 /// `Ip`. For example:
 /// ```
-/// use net_types::ip::{Ip, GenericOverIp, Subnet};
 /// struct AddrAndSubnet<I: Ip> {
 ///   addr: I::Addr,
 ///   subnet: Subnet<I::Addr>

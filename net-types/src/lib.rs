@@ -874,6 +874,14 @@ impl<A: ScopeableAddress + SpecifiedAddress, Z> AddrAndZone<A, Z> {
     pub fn into_specified_addr_zone(self) -> (SpecifiedAddr<A>, Z) {
         (SpecifiedAddr(self.0), self.1)
     }
+
+    /// Returns the address (as a [`SpecifiedAddr`]).
+    pub fn specified_addr(&self) -> SpecifiedAddr<A>
+    where
+        A: Copy,
+    {
+        SpecifiedAddr(self.0)
+    }
 }
 
 impl<A: ScopeableAddress + Display, Z: Display> Display for AddrAndZone<A, Z> {
@@ -917,6 +925,25 @@ impl<A: ScopeableAddress + SpecifiedAddress, Z> ZonedAddr<A, Z> {
             }
         }
     }
+
+    /// Accesses the `SpecifiedAddr` for this `ZonedAddr`.
+    pub fn addr(&self) -> SpecifiedAddr<A>
+    where
+        A: Copy,
+    {
+        match self {
+            ZonedAddr::Unzoned(addr) => *addr,
+            ZonedAddr::Zoned(addr_and_zone) => addr_and_zone.specified_addr(),
+        }
+    }
+
+    /// Translates the zone identifier using the provided function.
+    pub fn map_zone<Y>(self, f: impl FnOnce(Z) -> Y) -> ZonedAddr<A, Y> {
+        match self {
+            ZonedAddr::Unzoned(u) => ZonedAddr::Unzoned(u),
+            ZonedAddr::Zoned(z) => ZonedAddr::Zoned(z.map_zone(f)),
+        }
+    }
 }
 
 impl<A, Z> From<SpecifiedAddr<A>> for ZonedAddr<A, Z> {
@@ -941,6 +968,10 @@ impl<A: IpAddress, I: Ip> GenericOverIp<I> for MulticastAddr<A> {
 
 impl<A: IpAddress, I: Ip, D> GenericOverIp<I> for ZonedAddr<A, D> {
     type Type = ZonedAddr<I::Addr, D>;
+}
+
+impl<A: IpAddress, I: Ip, Z> GenericOverIp<I> for AddrAndZone<A, Z> {
+    type Type = AddrAndZone<I::Addr, Z>;
 }
 
 #[cfg(test)]
