@@ -900,7 +900,7 @@ impl<'a> BufferView<&'a [u8]> for LongLivedBuff<'a> {
 #[cfg(test)]
 mod tests {
     use test_case::test_case;
-    use zerocopy::{AsBytes, FromBytes, LayoutVerified, Unaligned};
+    use zerocopy::{AsBytes, FromBytes, FromZeros, NoCell, Ref, Unaligned};
 
     use super::*;
 
@@ -912,10 +912,10 @@ mod tests {
     fn get_empty_tuple_mut_ref<'a>() -> &'a mut () {
         // This is a hack since `&mut ()` is invalid.
         let bytes: &mut [u8] = &mut [];
-        zerocopy::LayoutVerified::<_, ()>::new_unaligned(bytes).unwrap().into_mut()
+        zerocopy::Ref::<_, ()>::new_unaligned(bytes).unwrap().into_mut()
     }
 
-    #[derive(Debug, AsBytes, FromBytes, Unaligned)]
+    #[derive(Debug, AsBytes, FromZeros, FromBytes, NoCell, Unaligned)]
     #[repr(C)]
     struct DummyRecord {
         a: [u8; 2],
@@ -943,7 +943,7 @@ mod tests {
 
     fn parse_dummy_rec<'a, BV>(
         data: &mut BV,
-    ) -> RecordParseResult<LayoutVerified<&'a [u8], DummyRecord>, DummyRecordErr>
+    ) -> RecordParseResult<Ref<&'a [u8], DummyRecord>, DummyRecordErr>
     where
         BV: BufferView<&'a [u8]>,
     {
@@ -970,7 +970,7 @@ mod tests {
     }
 
     impl<'a> RecordsImpl<'a> for ContextlessRecordImpl {
-        type Record = LayoutVerified<&'a [u8], DummyRecord>;
+        type Record = Ref<&'a [u8], DummyRecord>;
 
         fn parse_with_context<BV: BufferView<&'a [u8]>>(
             data: &mut BV,
@@ -993,7 +993,7 @@ mod tests {
     }
 
     impl<'a> RecordsImpl<'a> for LimitContextRecordImpl {
-        type Record = LayoutVerified<&'a [u8], DummyRecord>;
+        type Record = Ref<&'a [u8], DummyRecord>;
 
         fn parse_with_context<BV: BufferView<&'a [u8]>>(
             data: &mut BV,
@@ -1034,7 +1034,7 @@ mod tests {
     }
 
     impl<'a> RecordsImpl<'a> for FilterContextRecordImpl {
-        type Record = LayoutVerified<&'a [u8], DummyRecord>;
+        type Record = Ref<&'a [u8], DummyRecord>;
 
         fn parse_with_context<BV: BufferView<&'a [u8]>>(
             bytes: &mut BV,
@@ -1099,7 +1099,7 @@ mod tests {
     }
 
     impl<'a> RecordsImpl<'a> for StatefulContextRecordImpl {
-        type Record = LayoutVerified<&'a [u8], DummyRecord>;
+        type Record = Ref<&'a [u8], DummyRecord>;
 
         fn parse_with_context<BV: BufferView<&'a [u8]>>(
             data: &mut BV,
@@ -1133,7 +1133,7 @@ mod tests {
     fn parse_dummy_rec_with_context<'a, BV>(
         data: &mut BV,
         context: &mut StatefulContext,
-    ) -> RecordParseResult<LayoutVerified<&'a [u8], DummyRecord>, DummyRecordErr>
+    ) -> RecordParseResult<Ref<&'a [u8], DummyRecord>, DummyRecordErr>
     where
         BV: BufferView<&'a [u8]>,
     {
@@ -1334,8 +1334,8 @@ pub mod options {
     use core::mem;
     use core::num::{NonZeroUsize, TryFromIntError};
 
-    use nonzero_ext::nonzero;
-    use zerocopy::{byteorder::ByteOrder, AsBytes, FromBytes, Unaligned};
+    use const_unwrap::const_unwrap_option;
+    use zerocopy::{byteorder::ByteOrder, AsBytes, FromBytes, NoCell, Unaligned};
 
     use super::*;
 
@@ -1395,7 +1395,7 @@ pub mod options {
 
     impl<O: OptionBuilder> RecordBuilder for O {
         fn serialized_len(&self) -> usize {
-            // TODO(https://fxbug.dev/77981): Remove this `.expect`
+            // TODO(https://fxbug.dev/42158056): Remove this `.expect`
             <O::Layout as OptionLayout>::LENGTH_ENCODING
                 .record_length::<<O::Layout as OptionLayout>::KindLenField>(
                     OptionBuilder::serialized_len(self),
@@ -1417,7 +1417,7 @@ pub mod options {
             *BufferView::<&mut [u8]>::take_obj_front::<<O::Layout as OptionLayout>::KindLenField>(&mut data)
                 .expect("buffer too short") = self.option_kind();
             let body_len = OptionBuilder::serialized_len(self);
-            // TODO(https://fxbug.dev/77981): Remove this `.expect`
+            // TODO(https://fxbug.dev/42158056): Remove this `.expect`
             let length = <O::Layout as OptionLayout>::LENGTH_ENCODING
                 .encode_length::<<O::Layout as OptionLayout>::KindLenField>(body_len)
                 .expect("integer overflow while encoding length");
@@ -1543,6 +1543,7 @@ pub mod options {
     pub trait KindLenField:
         FromBytes
         + AsBytes
+        + NoCell
         + Unaligned
         + Into<usize>
         + TryFrom<usize, Error = TryFromIntError>
@@ -1600,8 +1601,9 @@ pub mod options {
         /// `option_len_multiplier` field, and it defaults to 1.
         ///
         /// [`TypeLengthValue`]: LengthEncoding::TypeLengthValue
-        const LENGTH_ENCODING: LengthEncoding =
-            LengthEncoding::TypeLengthValue { option_len_multiplier: nonzero!(1usize) };
+        const LENGTH_ENCODING: LengthEncoding = LengthEncoding::TypeLengthValue {
+            option_len_multiplier: const_unwrap_option(NonZeroUsize::new(1)),
+        };
     }
 
     /// An error encountered while parsing an option or sequence of options.
@@ -1797,7 +1799,6 @@ pub mod options {
         use core::convert::TryInto as _;
         use core::fmt::Debug;
 
-        use nonzero_ext::nonzero;
         use zerocopy::byteorder::network_endian::U16;
 
         use super::*;
@@ -1923,15 +1924,17 @@ pub mod options {
         impl OptionLayout for NdpOption {
             type KindLenField = u8;
 
-            const LENGTH_ENCODING: LengthEncoding =
-                LengthEncoding::TypeLengthValue { option_len_multiplier: nonzero!(8usize) };
+            const LENGTH_ENCODING: LengthEncoding = LengthEncoding::TypeLengthValue {
+                option_len_multiplier: const_unwrap_option(NonZeroUsize::new(8)),
+            };
         }
 
         impl OptionLayout for DummyNdpOptionsImpl {
             type KindLenField = u8;
 
-            const LENGTH_ENCODING: LengthEncoding =
-                LengthEncoding::TypeLengthValue { option_len_multiplier: nonzero!(8usize) };
+            const LENGTH_ENCODING: LengthEncoding = LengthEncoding::TypeLengthValue {
+                option_len_multiplier: const_unwrap_option(NonZeroUsize::new(8)),
+            };
         }
 
         impl OptionParseLayout for DummyNdpOptionsImpl {
@@ -2022,10 +2025,12 @@ pub mod options {
 
         #[test]
         fn test_length_encoding() {
-            const TLV_1: LengthEncoding =
-                LengthEncoding::TypeLengthValue { option_len_multiplier: nonzero!(1usize) };
-            const TLV_2: LengthEncoding =
-                LengthEncoding::TypeLengthValue { option_len_multiplier: nonzero!(2usize) };
+            const TLV_1: LengthEncoding = LengthEncoding::TypeLengthValue {
+                option_len_multiplier: const_unwrap_option(NonZeroUsize::new(1)),
+            };
+            const TLV_2: LengthEncoding = LengthEncoding::TypeLengthValue {
+                option_len_multiplier: const_unwrap_option(NonZeroUsize::new(2)),
+            };
 
             // Test LengthEncoding::record_length
 

@@ -17,12 +17,13 @@ use core::ops::Range;
 
 use net_types::ip::{Ip, IpAddress, IpVersionMarker};
 use packet::{
-    BufferView, BufferViewMut, ByteSliceInnerPacketBuilder, EmptyBuf, FromRaw, InnerPacketBuilder,
-    MaybeParsed, PacketBuilder, PacketConstraints, ParsablePacket, ParseMetadata, SerializeBuffer,
-    Serializer,
+    BufferView, BufferViewMut, ByteSliceInnerPacketBuilder, EmptyBuf, FragmentedBytesMut, FromRaw,
+    InnerPacketBuilder, MaybeParsed, PacketBuilder, PacketConstraints, ParsablePacket,
+    ParseMetadata, SerializeTarget, Serializer,
 };
 use zerocopy::{
-    byteorder::network_endian::U16, AsBytes, ByteSlice, FromBytes, LayoutVerified, Unaligned,
+    byteorder::network_endian::U16, AsBytes, ByteSlice, FromBytes, FromZeros, NoCell, Ref,
+    Unaligned,
 };
 
 use crate::error::{ParseError, ParseResult};
@@ -33,7 +34,7 @@ pub(crate) const HEADER_BYTES: usize = 8;
 const CHECKSUM_OFFSET: usize = 6;
 const CHECKSUM_RANGE: Range<usize> = CHECKSUM_OFFSET..CHECKSUM_OFFSET + 2;
 
-#[derive(Debug, FromBytes, AsBytes, Unaligned)]
+#[derive(Debug, FromZeros, FromBytes, AsBytes, NoCell, Unaligned)]
 #[repr(C)]
 struct Header {
     src_port: U16,
@@ -51,7 +52,7 @@ struct Header {
 /// A `UdpPacket` - whether parsed using `parse` or created using `serialize` -
 /// maintains the invariant that the checksum is always valid.
 pub struct UdpPacket<B> {
-    header: LayoutVerified<B, Header>,
+    header: Ref<B, Header>,
     body: B,
 }
 
@@ -214,7 +215,7 @@ impl<B: ByteSlice> UdpPacket<B> {
 ///
 /// A `UdpPacketHeader` may be the result of a partially parsed UDP packet in
 /// [`UdpPacketRaw`].
-#[derive(Debug, Default, FromBytes, AsBytes, Unaligned, PartialEq)]
+#[derive(Debug, Default, FromZeros, FromBytes, AsBytes, NoCell, Unaligned, PartialEq)]
 #[repr(C)]
 struct UdpFlowHeader {
     src_port: U16,
@@ -224,7 +225,7 @@ struct UdpFlowHeader {
 /// A partially parsed UDP packet header.
 #[derive(Debug)]
 struct PartialHeader<B: ByteSlice> {
-    flow: LayoutVerified<B, UdpFlowHeader>,
+    flow: Ref<B, UdpFlowHeader>,
     rest: B,
 }
 
@@ -242,7 +243,7 @@ struct PartialHeader<B: ByteSlice> {
 /// [`UdpPacket`] provides a [`FromRaw`] implementation that can be used to
 /// validate a `UdpPacketRaw`.
 pub struct UdpPacketRaw<B: ByteSlice> {
-    header: MaybeParsed<LayoutVerified<B, Header>, PartialHeader<B>>,
+    header: MaybeParsed<Ref<B, Header>, PartialHeader<B>>,
     body: MaybeParsed<B, B>,
 }
 
@@ -443,15 +444,17 @@ impl<A: IpAddress> PacketBuilder for UdpPacketBuilder<A> {
         )
     }
 
-    fn serialize(&self, buffer: &mut SerializeBuffer<'_, '_>) {
+    fn serialize(&self, target: &mut SerializeTarget<'_>, body: FragmentedBytesMut<'_, '_>) {
         // See for details: https://en.wikipedia.org/wiki/User_Datagram_Protocol#Packet_structure
 
-        let total_len = buffer.len();
-        let mut header = buffer.header();
-        // implements BufferViewMut, giving us write_obj_front method
-        let mut header = &mut header;
+        let total_len = target.header.len() + body.len() + target.footer.len();
 
-        header.write_obj_front(&Header {
+        // `write_obj_front` consumes the extent of the receiving slice, but
+        // that behavior is undesirable here: at the end of this method, we
+        // write the checksum back into the header. To avoid this, we re-slice
+        // header before calling `write_obj_front`; the re-slice will be
+        // consumed, but `target.header` is unaffected.
+        (&mut &mut target.header[..]).write_obj_front(&Header {
             src_port: U16::new(self.src_port.map_or(0, NonZeroU16::get)),
             dst_port: U16::new(self.dst_port.map_or(0, NonZeroU16::get)),
             length: U16::new(total_len.try_into().unwrap_or_else(|_| {
@@ -473,7 +476,8 @@ impl<A: IpAddress> PacketBuilder for UdpPacketBuilder<A> {
             self.src_ip,
             self.dst_ip,
             IpProto::Udp.into(),
-            buffer,
+            target,
+            body,
         )
         .unwrap_or_else(|| {
             panic!(
@@ -484,7 +488,7 @@ impl<A: IpAddress> PacketBuilder for UdpPacketBuilder<A> {
         if checksum == [0, 0] {
             checksum = [0xFF, 0xFF];
         }
-        buffer.header()[CHECKSUM_RANGE].copy_from_slice(&checksum[..]);
+        target.header[CHECKSUM_RANGE].copy_from_slice(&checksum[..]);
     }
 }
 
@@ -716,11 +720,10 @@ mod tests {
         let mut buf = [0u8; 7];
         let mut buf = [&mut buf[..]];
         let buf = FragmentedBytesMut::new(&mut buf[..]);
-        let (head, body, foot) = buf.try_split_contiguous(..).unwrap();
-        let mut buffer = SerializeBuffer::new(head, body, foot);
+        let (header, body, footer) = buf.try_split_contiguous(..).unwrap();
         let builder =
             UdpPacketBuilder::new(TEST_SRC_IPV4, TEST_DST_IPV4, None, NonZeroU16::new(1).unwrap());
-        builder.serialize(&mut buffer);
+        builder.serialize(&mut SerializeTarget { header, footer }, body);
     }
 
     #[test]
@@ -863,7 +866,12 @@ mod tests {
 
     fn bench_parse_inner<B: Bencher>(b: &mut B) {
         use crate::testdata::dns_request_v4::*;
-        let bytes = parse_ip_packet_in_ethernet_frame::<Ipv4>(ETHERNET_FRAME.bytes).unwrap().0;
+        let bytes = parse_ip_packet_in_ethernet_frame::<Ipv4>(
+            ETHERNET_FRAME.bytes,
+            EthernetFrameLengthCheck::Check,
+        )
+        .unwrap()
+        .0;
 
         b.iter(|| {
             let buf = bytes;

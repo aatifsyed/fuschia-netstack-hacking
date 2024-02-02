@@ -9,7 +9,9 @@ use core::fmt;
 
 use net_types::ip::{Ipv4, Ipv4Addr};
 use packet::{BufferView, ParsablePacket, ParseMetadata};
-use zerocopy::{byteorder::network_endian::U32, AsBytes, ByteSlice, FromBytes, Unaligned};
+use zerocopy::{
+    byteorder::network_endian::U32, AsBytes, ByteSlice, FromBytes, FromZeros, NoCell, Unaligned,
+};
 
 use crate::error::{ParseError, ParseResult};
 
@@ -150,8 +152,6 @@ impl_icmp_message!(
     Icmpv4DestUnreachableCode,
     OriginalPacket<B>
 );
-impl_icmp_message!(Ipv4, IcmpEchoRequest, EchoRequest, IcmpUnusedCode, OriginalPacket<B>);
-impl_icmp_message!(Ipv4, IcmpEchoReply, EchoReply, IcmpUnusedCode, OriginalPacket<B>);
 
 create_protocol_enum!(
     #[allow(missing_docs)]
@@ -165,7 +165,7 @@ create_protocol_enum!(
 );
 
 /// An ICMPv4 Redirect Message.
-#[derive(Copy, Clone, Debug, FromBytes, AsBytes, Unaligned)]
+#[derive(Copy, Clone, Debug, FromZeros, FromBytes, AsBytes, NoCell, Unaligned)]
 #[repr(C)]
 pub struct Icmpv4Redirect {
     gateway: Ipv4Addr,
@@ -184,7 +184,7 @@ create_protocol_enum!(
 
 impl_icmp_message!(Ipv4, IcmpTimeExceeded, TimeExceeded, Icmpv4TimeExceededCode, OriginalPacket<B>);
 
-#[derive(Copy, Clone, Debug, FromBytes, AsBytes, Unaligned, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, FromZeros, FromBytes, AsBytes, NoCell, Unaligned, Eq, PartialEq)]
 #[repr(C)]
 struct IcmpTimestampData {
     origin_timestamp: U32,
@@ -192,7 +192,7 @@ struct IcmpTimestampData {
     tx_timestamp: U32,
 }
 
-#[derive(Copy, Clone, Debug, FromBytes, AsBytes, Unaligned, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, FromZeros, FromBytes, AsBytes, NoCell, Unaligned, Eq, PartialEq)]
 #[repr(C)]
 struct Timestamp {
     id_seq: IdAndSeq,
@@ -200,7 +200,7 @@ struct Timestamp {
 }
 
 /// An ICMPv4 Timestamp Request message.
-#[derive(Copy, Clone, Debug, FromBytes, AsBytes, Unaligned)]
+#[derive(Copy, Clone, Debug, FromZeros, FromBytes, AsBytes, NoCell, Unaligned)]
 #[repr(transparent)]
 pub struct Icmpv4TimestampRequest(Timestamp);
 
@@ -242,7 +242,7 @@ impl Icmpv4TimestampRequest {
 }
 
 /// An ICMPv4 Timestamp Reply message.
-#[derive(Copy, Clone, Debug, FromBytes, AsBytes, Unaligned, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, FromZeros, FromBytes, AsBytes, NoCell, Unaligned, Eq, PartialEq)]
 #[repr(transparent)]
 pub struct Icmpv4TimestampReply(Timestamp);
 
@@ -260,7 +260,7 @@ create_protocol_enum! (
 );
 
 /// An ICMPv4 Parameter Problem message.
-#[derive(Copy, Clone, Debug, FromBytes, AsBytes, Unaligned)]
+#[derive(Copy, Clone, Debug, FromZeros, FromBytes, AsBytes, NoCell, Unaligned)]
 #[repr(C)]
 pub struct Icmpv4ParameterProblem {
     pointer: u8,
@@ -293,7 +293,7 @@ mod tests {
     use crate::icmp::{IcmpMessage, MessageBody};
     use crate::ipv4::{Ipv4Header, Ipv4Packet, Ipv4PacketBuilder};
 
-    fn serialize_to_bytes<B: ByteSlice + Debug, M: IcmpMessage<Ipv4, B> + Debug>(
+    fn serialize_to_bytes<B: ByteSlice + Debug, M: IcmpMessage<Ipv4> + Debug>(
         src_ip: Ipv4Addr,
         dst_ip: Ipv4Addr,
         icmp: &IcmpPacket<Ipv4, B, M>,
@@ -311,7 +311,7 @@ mod tests {
     }
 
     fn test_parse_and_serialize<
-        M: for<'a> IcmpMessage<Ipv4, &'a [u8]> + Debug,
+        M: IcmpMessage<Ipv4> + Debug,
         F: for<'a> FnOnce(&IcmpPacket<Ipv4, &'a [u8], M>),
     >(
         mut req: &[u8],

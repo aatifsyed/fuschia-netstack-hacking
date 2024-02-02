@@ -394,7 +394,7 @@ impl<'a> RecordsImpl<'a> for Ipv6ExtensionHeaderImpl {
                 //   Pointer field containing the offset of the unrecognized value
                 //   within the original packet.
                 Err(Ipv6ExtensionHeaderParsingError::UnrecognizedNextHeader {
-                    // TODO(https://fxbug.dev/78130): When overhauling packet
+                    // TODO(https://fxbug.dev/42158223): When overhauling packet
                     // validation, return the right values for `pointer` and
                     // `header_len`.
                     pointer: u32::MAX,
@@ -1194,7 +1194,7 @@ fn ext_hdr_opt_err_to_ext_hdr_err(
 fn get_empty_tuple_mut_ref<'a>() -> &'a mut () {
     // This is a hack since `&mut ()` is invalid.
     let bytes: &mut [u8] = &mut [];
-    zerocopy::LayoutVerified::<_, ()>::new_unaligned(bytes).unwrap().into_mut()
+    zerocopy::Ref::<_, ()>::new_unaligned(bytes).unwrap().into_mut()
 }
 
 #[cfg(test)]

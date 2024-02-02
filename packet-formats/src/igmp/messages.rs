@@ -11,7 +11,8 @@ use net_types::ip::Ipv4Addr;
 use packet::records::{ParsedRecord, RecordParseResult, Records, RecordsImpl, RecordsImplLayout};
 use packet::{BufferView, ParsablePacket, ParseMetadata};
 use zerocopy::{
-    byteorder::network_endian::U16, AsBytes, ByteSlice, FromBytes, LayoutVerified, Unaligned,
+    byteorder::network_endian::U16, AsBytes, ByteSlice, FromBytes, FromZeros, NoCell, Ref,
+    Unaligned,
 };
 
 use super::{
@@ -104,7 +105,7 @@ impl<B> MessageType<B> for IgmpMembershipQueryV2 {
 /// A `MembershipQueryData` struct represents the fixed data in IGMPv3
 /// Membership Queries.
 /// It is defined as the `FixedHeader` type for `IgmpMembershipQueryV3`.
-#[derive(Copy, Clone, Debug, AsBytes, FromBytes, Unaligned)]
+#[derive(Copy, Clone, Debug, AsBytes, FromZeros, FromBytes, NoCell, Unaligned)]
 #[repr(C)]
 pub struct MembershipQueryData {
     group_address: Ipv4Addr,
@@ -194,11 +195,11 @@ impl MembershipQueryData {
 #[derive(Copy, Clone, Debug)]
 pub struct IgmpMembershipQueryV3;
 
-impl<B> IgmpNonEmptyBody for LayoutVerified<B, [Ipv4Addr]> {}
+impl<B> IgmpNonEmptyBody for Ref<B, [Ipv4Addr]> {}
 
 impl<B> MessageType<B> for IgmpMembershipQueryV3 {
     type FixedHeader = MembershipQueryData;
-    type VariableBody = LayoutVerified<B, [Ipv4Addr]>;
+    type VariableBody = Ref<B, [Ipv4Addr]>;
     type MaxRespTime = IgmpResponseTimeV3;
     const TYPE: IgmpMessageType = IgmpMessageType::MembershipQuery;
 
@@ -227,7 +228,7 @@ impl<B> MessageType<B> for IgmpMembershipQueryV3 {
 /// A `MembershipReportV3Data` struct represents the fixed data in IGMPv3
 /// Membership Reports.
 /// It is defined as the `FixedHeader` type for `IgmpMembershipReportV3`.
-#[derive(Copy, Clone, Debug, AsBytes, FromBytes, Unaligned)]
+#[derive(Copy, Clone, Debug, AsBytes, FromZeros, FromBytes, NoCell, Unaligned)]
 #[repr(C)]
 pub struct MembershipReportV3Data {
     _reserved: [u8; 2],
@@ -265,7 +266,7 @@ create_protocol_enum!(
 /// The `GroupRecordHeader` is followed by a series of source IPv4 addresses.
 ///
 /// [RFC 3376 section 4.2.4]: https://tools.ietf.org/html/rfc3376#section-4.2.4
-#[derive(Copy, Clone, Debug, AsBytes, FromBytes, Unaligned)]
+#[derive(Copy, Clone, Debug, AsBytes, FromZeros, FromBytes, NoCell, Unaligned)]
 #[repr(C)]
 pub struct GroupRecordHeader {
     record_type: u8,
@@ -307,8 +308,8 @@ impl GroupRecordHeader {
 ///
 /// [RFC 3376 section 4.2.10]: https://tools.ietf.org/html/rfc3376#section-4.2.10
 pub struct GroupRecord<B> {
-    header: LayoutVerified<B, GroupRecordHeader>,
-    sources: LayoutVerified<B, [Ipv4Addr]>,
+    header: Ref<B, GroupRecordHeader>,
+    sources: Ref<B, [Ipv4Addr]>,
 }
 
 impl<B: ByteSlice> GroupRecord<B> {

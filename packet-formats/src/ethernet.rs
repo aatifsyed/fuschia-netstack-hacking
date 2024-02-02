@@ -7,12 +7,12 @@
 use net_types::ethernet::Mac;
 use net_types::ip::{Ip, Ipv4, Ipv6};
 use packet::{
-    BufferView, BufferViewMut, PacketBuilder, PacketConstraints, ParsablePacket, ParseMetadata,
-    SerializeBuffer,
+    BufferView, BufferViewMut, FragmentedBytesMut, PacketBuilder, PacketConstraints,
+    ParsablePacket, ParseMetadata, SerializeTarget,
 };
 use zerocopy::{
     byteorder::network_endian::{U16, U32},
-    AsBytes, ByteSlice, FromBytes, LayoutVerified, Unaligned,
+    AsBytes, ByteSlice, FromBytes, FromZeros, NoCell, Ref, Unaligned,
 };
 
 use crate::error::{ParseError, ParseResult};
@@ -46,7 +46,7 @@ impl EthernetIpExt for Ipv6 {
     const ETHER_TYPE: EtherType = EtherType::Ipv6;
 }
 
-#[derive(FromBytes, AsBytes, Unaligned)]
+#[derive(FromZeros, FromBytes, AsBytes, NoCell, Unaligned)]
 #[repr(C)]
 struct HeaderPrefix {
     dst_mac: Mac,
@@ -62,9 +62,9 @@ const TPID_8021AD: u16 = 0x88a8;
 /// parsed from or serialized to, meaning that no copying or extra allocation is
 /// necessary.
 pub struct EthernetFrame<B> {
-    hdr_prefix: LayoutVerified<B, HeaderPrefix>,
-    tag: Option<LayoutVerified<B, U32>>,
-    ethertype: LayoutVerified<B, U16>,
+    hdr_prefix: Ref<B, HeaderPrefix>,
+    tag: Option<Ref<B, U32>>,
+    ethertype: Ref<B, U16>,
     body: B,
 }
 
@@ -163,6 +163,14 @@ impl<B: ByteSlice> EthernetFrame<B> {
         &self.body
     }
 
+    /// Consumes the frame and returns the body.
+    pub fn into_body(self) -> B
+    where
+        B: Copy,
+    {
+        self.body
+    }
+
     /// The source MAC address.
     pub fn src_mac(&self) -> Mac {
         self.hdr_prefix.src_mac
@@ -211,22 +219,39 @@ impl<B: ByteSlice> EthernetFrame<B> {
             src_mac: self.src_mac(),
             dst_mac: self.dst_mac(),
             ethertype: self.ethertype.get(),
+            min_body_len: ETHERNET_MIN_BODY_LEN_NO_TAG,
         }
     }
 }
 
 /// A builder for Ethernet frames.
+///
+/// A [`PacketBuilder`] that serializes into an Ethernet frame. The padding
+/// parameter `P` can be used to choose how the body of the frame is padded.
 #[derive(Debug)]
 pub struct EthernetFrameBuilder {
     src_mac: Mac,
     dst_mac: Mac,
     ethertype: u16,
+    min_body_len: usize,
 }
 
 impl EthernetFrameBuilder {
     /// Construct a new `EthernetFrameBuilder`.
-    pub fn new(src_mac: Mac, dst_mac: Mac, ethertype: EtherType) -> EthernetFrameBuilder {
-        EthernetFrameBuilder { src_mac, dst_mac, ethertype: ethertype.into() }
+    ///
+    /// The provided source and destination [`Mac`] addresses and [`EtherType`]
+    /// will be placed in the Ethernet frame header. The `min_body_len`
+    /// parameter sets the minimum length of the frame's body in bytes. If,
+    /// during serialization, the inner packet builder produces a smaller body
+    /// than `min_body_len`, it will be padded with trailing zero bytes up to
+    /// `min_body_len`.
+    pub fn new(
+        src_mac: Mac,
+        dst_mac: Mac,
+        ethertype: EtherType,
+        min_body_len: usize,
+    ) -> EthernetFrameBuilder {
+        EthernetFrameBuilder { src_mac, dst_mac, ethertype: ethertype.into(), min_body_len }
     }
 }
 
@@ -237,23 +262,17 @@ impl EthernetFrameBuilder {
 
 impl PacketBuilder for EthernetFrameBuilder {
     fn constraints(&self) -> PacketConstraints {
-        PacketConstraints::new(
-            ETHERNET_HDR_LEN_NO_TAG,
-            0,
-            ETHERNET_MIN_BODY_LEN_NO_TAG,
-            core::usize::MAX,
-        )
+        PacketConstraints::new(ETHERNET_HDR_LEN_NO_TAG, 0, self.min_body_len, core::usize::MAX)
     }
 
-    fn serialize(&self, buffer: &mut SerializeBuffer<'_, '_>) {
+    fn serialize(&self, target: &mut SerializeTarget<'_>, body: FragmentedBytesMut<'_, '_>) {
         // NOTE: EtherType values of 1500 and below are used to indicate the
         // length of the body in bytes. We don't need to validate this because
         // the EtherType enum has no variants with values in that range.
 
-        let total_len = buffer.header().len() + buffer.body().len();
-        let mut header = buffer.header();
+        let total_len = target.header.len() + body.len();
         // implements BufferViewMut, giving us take_obj_xxx_zero methods
-        let mut header = &mut header;
+        let mut header = &mut target.header;
 
         header
             .write_obj_front(&HeaderPrefix { src_mac: self.src_mac, dst_mac: self.dst_mac })
@@ -264,9 +283,7 @@ impl PacketBuilder for EthernetFrameBuilder {
 
         // NOTE(joshlf): This doesn't include the tag. If we ever add support
         // for serializing tags, we will need to update this.
-        let min_frame_size = ETHERNET_MIN_BODY_LEN_NO_TAG
-            + core::mem::size_of::<HeaderPrefix>()
-            + core::mem::size_of::<U16>();
+        let min_frame_size = self.min_body_len + ETHERNET_HDR_LEN_NO_TAG;
 
         // Assert this here so that if there isn't enough space for even an
         // Ethernet header, we report that more specific error.
@@ -300,7 +317,8 @@ pub mod testutil {
 #[cfg(test)]
 mod tests {
     use packet::{
-        AsFragmentedByteSlice, Buf, InnerPacketBuilder, ParseBuffer, SerializeBuffer, Serializer,
+        AsFragmentedByteSlice, Buf, GrowBufferMut, InnerPacketBuilder, ParseBuffer,
+        SerializeTarget, Serializer,
     };
     use zerocopy::byteorder::{ByteOrder, NetworkEndian};
 
@@ -429,6 +447,7 @@ mod tests {
                 DEFAULT_DST_MAC,
                 DEFAULT_SRC_MAC,
                 EtherType::Arp,
+                ETHERNET_MIN_BODY_LEN_NO_TAG,
             ))
             .serialize_vec_outer()
             .unwrap();
@@ -448,6 +467,7 @@ mod tests {
                 DEFAULT_SRC_MAC,
                 DEFAULT_DST_MAC,
                 EtherType::Arp,
+                ETHERNET_MIN_BODY_LEN_NO_TAG,
             ))
             .serialize_vec_outer()
             .unwrap()
@@ -459,6 +479,7 @@ mod tests {
                 DEFAULT_SRC_MAC,
                 DEFAULT_DST_MAC,
                 EtherType::Arp,
+                ETHERNET_MIN_BODY_LEN_NO_TAG,
             ))
             .serialize_vec_outer()
             .unwrap()
@@ -519,13 +540,50 @@ mod tests {
         let mut buf = [0u8; ETHERNET_MIN_FRAME_LEN - 1];
         let mut b = [&mut buf[..]];
         let buf = b.as_fragmented_byte_slice();
-        let (head, body, foot) = buf.try_split_contiguous(ETHERNET_HDR_LEN_NO_TAG..).unwrap();
-        let mut buffer = SerializeBuffer::new(head, body, foot);
+        let (header, body, footer) = buf.try_split_contiguous(ETHERNET_HDR_LEN_NO_TAG..).unwrap();
         EthernetFrameBuilder::new(
             Mac::new([0, 1, 2, 3, 4, 5]),
             Mac::new([6, 7, 8, 9, 10, 11]),
             EtherType::Arp,
+            ETHERNET_MIN_BODY_LEN_NO_TAG,
         )
-        .serialize(&mut buffer);
+        .serialize(&mut SerializeTarget { header, footer }, body);
+    }
+
+    #[test]
+    fn test_custom_min_body_len() {
+        const MIN_BODY_LEN: usize = 4;
+        const UNWRITTEN_BYTE: u8 = 0xAA;
+
+        let builder = EthernetFrameBuilder::new(
+            Mac::new([0, 1, 2, 3, 4, 5]),
+            Mac::new([6, 7, 8, 9, 10, 11]),
+            EtherType::Arp,
+            MIN_BODY_LEN,
+        );
+
+        let mut buffer = [UNWRITTEN_BYTE; ETHERNET_MIN_FRAME_LEN];
+        // TODO(https://fxbug.dev/42079821): Don't use this `#[doc(hidden)]`
+        // method, and use the public API instead.
+        GrowBufferMut::serialize(
+            &mut Buf::new(&mut buffer[..], ETHERNET_HDR_LEN_NO_TAG..ETHERNET_HDR_LEN_NO_TAG),
+            builder,
+        );
+
+        let (header, tail) = buffer.split_at(ETHERNET_HDR_LEN_NO_TAG);
+        let (padding, unwritten) = tail.split_at(MIN_BODY_LEN);
+        assert_eq!(
+            header,
+            &[
+                6, 7, 8, 9, 10, 11, // dst_mac
+                0, 1, 2, 3, 4, 5, // src_mac
+                08, 06, // ethertype
+            ]
+        );
+        assert_eq!(padding, &[0; MIN_BODY_LEN]);
+        assert_eq!(
+            unwritten,
+            &[UNWRITTEN_BYTE; ETHERNET_MIN_FRAME_LEN - MIN_BODY_LEN - ETHERNET_HDR_LEN_NO_TAG]
+        );
     }
 }

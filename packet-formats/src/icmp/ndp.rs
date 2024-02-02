@@ -11,7 +11,7 @@ use core::time::Duration;
 use net_types::ip::{Ipv6, Ipv6Addr};
 use zerocopy::{
     byteorder::network_endian::{U16, U32},
-    AsBytes, ByteSlice, FromBytes, Unaligned,
+    AsBytes, ByteSlice, FromBytes, FromZeros, NoCell, Unaligned,
 };
 
 use crate::icmp::{IcmpIpExt, IcmpPacket, IcmpUnusedCode};
@@ -97,7 +97,9 @@ pub type OptionSequenceBuilder<'a, I> =
     packet::records::options::OptionSequenceBuilder<options::NdpOptionBuilder<'a>, I>;
 
 /// An NDP Router Solicitation.
-#[derive(Copy, Clone, Default, Debug, FromBytes, AsBytes, Unaligned, PartialEq, Eq)]
+#[derive(
+    Copy, Clone, Default, Debug, FromZeros, FromBytes, AsBytes, NoCell, Unaligned, PartialEq, Eq,
+)]
 #[repr(C)]
 pub struct RouterSolicitation {
     _reserved: [u8; 4],
@@ -178,7 +180,7 @@ impl TryFrom<u8> for RoutePreference {
 }
 
 /// An NDP Router Advertisement.
-#[derive(Copy, Clone, Debug, FromBytes, AsBytes, Unaligned, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, FromZeros, FromBytes, AsBytes, NoCell, Unaligned, PartialEq, Eq)]
 #[repr(C)]
 pub struct RouterAdvertisement {
     current_hop_limit: u8,
@@ -324,7 +326,7 @@ impl RouterAdvertisement {
 }
 
 /// An NDP Neighbor Solicitation.
-#[derive(Copy, Clone, Debug, FromBytes, AsBytes, Unaligned, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, FromZeros, FromBytes, AsBytes, NoCell, Unaligned, PartialEq, Eq)]
 #[repr(C)]
 pub struct NeighborSolicitation {
     _reserved: [u8; 4],
@@ -347,7 +349,7 @@ impl NeighborSolicitation {
 }
 
 /// An NDP Neighbor Advertisement.
-#[derive(Copy, Clone, Debug, FromBytes, AsBytes, Unaligned, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, FromZeros, FromBytes, AsBytes, NoCell, Unaligned, PartialEq, Eq)]
 #[repr(C)]
 pub struct NeighborAdvertisement {
     flags_rso: u8,
@@ -433,7 +435,7 @@ impl NeighborAdvertisement {
 }
 
 /// An ICMPv6 Redirect Message.
-#[derive(Copy, Clone, Debug, FromBytes, AsBytes, Unaligned, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, FromZeros, FromBytes, AsBytes, NoCell, Unaligned, PartialEq, Eq)]
 #[repr(C)]
 pub struct Redirect {
     _reserved: [u8; 4],
@@ -446,17 +448,18 @@ impl_icmp_message!(Ipv6, Redirect, Redirect, IcmpUnusedCode, Options<B>);
 /// Parsing and serialization of NDP options.
 pub mod options {
     use core::convert::TryFrom;
+    use core::num::NonZeroUsize;
     use core::time::Duration;
 
+    use const_unwrap::const_unwrap_option;
     use net_types::ip::{IpAddress as _, Ipv6Addr, Subnet, SubnetError};
     use net_types::UnicastAddress;
-    use nonzero_ext::nonzero;
     use packet::records::options::{
         LengthEncoding, OptionBuilder, OptionLayout, OptionParseErr, OptionParseLayout, OptionsImpl,
     };
     use packet::BufferView as _;
     use zerocopy::byteorder::{network_endian::U32, ByteOrder, NetworkEndian};
-    use zerocopy::{AsBytes, FromBytes, LayoutVerified, Unaligned};
+    use zerocopy::{AsBytes, FromBytes, FromZeros, NoCell, Ref, Unaligned};
 
     use super::NonZeroNdpLifetime;
     use crate::utils::NonZeroDuration;
@@ -464,7 +467,7 @@ pub mod options {
     /// A value representing an infinite lifetime for various NDP options'
     /// lifetime fields.
     pub const INFINITE_LIFETIME: NonZeroDuration =
-        NonZeroDuration::from_nonzero_secs(nonzero!(core::u32::MAX as u64));
+        const_unwrap_option(NonZeroDuration::from_secs(core::u32::MAX as u64));
 
     /// The number of reserved bytes immediately following the kind and length
     /// bytes in a Redirected Header option.
@@ -583,7 +586,7 @@ pub mod options {
     /// ```
     ///
     /// [RFC 4191 section 2.3]: https://datatracker.ietf.org/doc/html/rfc4191#section-2.3
-    #[derive(FromBytes, AsBytes, Unaligned)]
+    #[derive(FromZeros, FromBytes, AsBytes, NoCell, Unaligned)]
     #[repr(C)]
     struct RouteInformationHeader {
         prefix_length: u8,
@@ -650,6 +653,11 @@ pub mod options {
             self.preference
         }
 
+        /// Returns the lifetime of the route.
+        pub fn route_lifetime(&self) -> Option<NonZeroNdpLifetime> {
+            NonZeroNdpLifetime::from_u32_with_infinite(self.route_lifetime_seconds)
+        }
+
         fn prefix_bytes_len(&self) -> usize {
             let RouteInformation { prefix, route_lifetime_seconds: _, preference: _ } = self;
 
@@ -680,9 +688,8 @@ pub mod options {
         }
 
         fn serialize(&self, buffer: &mut [u8]) {
-            let (mut hdr, buffer) =
-                LayoutVerified::<_, RouteInformationHeader>::new_from_prefix(buffer)
-                    .expect("expected buffer to hold enough bytes for serialization");
+            let (mut hdr, buffer) = Ref::<_, RouteInformationHeader>::new_from_prefix(buffer)
+                .expect("expected buffer to hold enough bytes for serialization");
 
             let prefix_bytes_len = self.prefix_bytes_len();
             let RouteInformation { prefix, route_lifetime_seconds, preference } = self;
@@ -708,7 +715,7 @@ pub mod options {
     /// See [RFC 4861 section 4.6.2].
     ///
     /// [RFC 4861 section 4.6.2]: https://tools.ietf.org/html/rfc4861#section-4.6.2
-    #[derive(Debug, FromBytes, AsBytes, Unaligned, PartialEq, Eq, Clone)]
+    #[derive(Debug, FromZeros, FromBytes, AsBytes, NoCell, Unaligned, PartialEq, Eq, Clone)]
     #[repr(C)]
     pub struct PrefixInformation {
         prefix_length: u8,
@@ -806,7 +813,7 @@ pub mod options {
         ///
         /// The number of valid leading bits in this prefix is available
         /// from [`PrefixInformation::prefix_length`];
-        // TODO(https://fxbug.dev/91764): Consider merging prefix and prefix_length and return a
+        // TODO(https://fxbug.dev/42173363): Consider merging prefix and prefix_length and return a
         // Subnet.
         pub fn prefix(&self) -> &Ipv6Addr {
             &self.prefix
@@ -856,12 +863,13 @@ pub mod options {
         type KindLenField = u8;
 
         // For NDP options the length should be multiplied by 8.
-        const LENGTH_ENCODING: LengthEncoding =
-            LengthEncoding::TypeLengthValue { option_len_multiplier: nonzero!(8usize) };
+        const LENGTH_ENCODING: LengthEncoding = LengthEncoding::TypeLengthValue {
+            option_len_multiplier: const_unwrap_option(NonZeroUsize::new(8)),
+        };
     }
 
     impl OptionParseLayout for NdpOptionsImpl {
-        // TODO(fxbug.dev/52288): Return more verbose logs on parsing errors.
+        // TODO(https://fxbug.dev/42129573): Return more verbose logs on parsing errors.
         type Error = OptionParseErr;
 
         // NDP options don't have END_OF_OPTIONS or NOP.
@@ -883,8 +891,7 @@ pub mod options {
                 NdpOptionType::SourceLinkLayerAddress => NdpOption::SourceLinkLayerAddress(data),
                 NdpOptionType::TargetLinkLayerAddress => NdpOption::TargetLinkLayerAddress(data),
                 NdpOptionType::PrefixInformation => {
-                    let data =
-                        LayoutVerified::<_, PrefixInformation>::new(data).ok_or(OptionParseErr)?;
+                    let data = Ref::<_, PrefixInformation>::new(data).ok_or(OptionParseErr)?;
                     NdpOption::PrefixInformation(data.into_ref())
                 }
                 NdpOptionType::RedirectedHeader => NdpOption::RedirectedHeader {
@@ -906,11 +913,11 @@ pub mod options {
                     // As per RFC 8106 section 5.1, the 32 bit lifetime field immediately
                     // follows the reserved field.
                     let (lifetime, data) =
-                        LayoutVerified::<_, U32>::new_from_prefix(data).ok_or(OptionParseErr)?;
+                        Ref::<_, U32>::new_from_prefix(data).ok_or(OptionParseErr)?;
 
                     // As per RFC 8106 section 5.1, the list of addresses immediately
                     // follows the lifetime field.
-                    let addresses = LayoutVerified::<_, [Ipv6Addr]>::new_slice_unaligned(data)
+                    let addresses = Ref::<_, [Ipv6Addr]>::new_slice_unaligned(data)
                         .ok_or(OptionParseErr)?
                         .into_slice();
 
@@ -927,7 +934,7 @@ pub mod options {
                 NdpOptionType::RouteInformation => {
                     // RouteInfoFixed represents the part of the RouteInformation option
                     // with a known and fixed length. See RFC 4191 section 2.3.
-                    #[derive(FromBytes, Unaligned)]
+                    #[derive(FromZeros, FromBytes, NoCell, Unaligned)]
                     #[repr(C)]
                     struct RouteInfoFixed {
                         prefix_length: u8,
@@ -1107,7 +1114,7 @@ mod tests {
     use packet::{InnerPacketBuilder, ParseBuffer};
     use test_case::test_case;
     use zerocopy::byteorder::{ByteOrder, NetworkEndian};
-    use zerocopy::LayoutVerified;
+    use zerocopy::Ref;
 
     use super::*;
     use crate::icmp::{IcmpPacket, IcmpPacketBuilder, IcmpParseArgs};
@@ -1311,7 +1318,7 @@ mod tests {
             [options::NdpOptionBuilder::SourceLinkLayerAddress(&SOURCE_LINK_LAYER_ADDRESS)];
         let serialized = OptionSequenceBuilder::new(option_builders.iter())
             .into_serializer()
-            .encapsulate(IcmpPacketBuilder::<Ipv6, &[u8], _>::new(
+            .encapsulate(IcmpPacketBuilder::<Ipv6, _>::new(
                 src_ip,
                 dst_ip,
                 IcmpUnusedCode,
@@ -1342,7 +1349,7 @@ mod tests {
 
         let serialized = []
             .into_serializer()
-            .encapsulate(IcmpPacketBuilder::<Ipv6, &[u8], _>::new(
+            .encapsulate(IcmpPacketBuilder::<Ipv6, _>::new(
                 src_ip,
                 dst_ip,
                 IcmpUnusedCode,
@@ -1472,7 +1479,7 @@ mod tests {
         ];
         let serialized = OptionSequenceBuilder::new(option_builders.iter())
             .into_serializer()
-            .encapsulate(IcmpPacketBuilder::<Ipv6, &[u8], _>::new(
+            .encapsulate(IcmpPacketBuilder::<Ipv6, _>::new(
                 src_ip,
                 dst_ip,
                 IcmpUnusedCode,
@@ -1532,7 +1539,7 @@ mod tests {
         const DST_IP: Ipv6Addr =
             Ipv6Addr::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17]);
         let serialized = packet::EmptyBuf
-            .encapsulate(IcmpPacketBuilder::<Ipv6, &[u8], _>::new(
+            .encapsulate(IcmpPacketBuilder::<Ipv6, _>::new(
                 SRC_IP,
                 DST_IP,
                 IcmpUnusedCode,
@@ -1582,13 +1589,13 @@ mod tests {
         }
         expected[5] |= u8::from(preference) << 3;
         let (mut router_lifetime, _rest) =
-            LayoutVerified::<_, U16>::new_from_prefix(&mut expected[6..]).unwrap();
+            Ref::<_, U16>::new_from_prefix(&mut expected[6..]).unwrap();
         router_lifetime.set(router_lifetime_seconds);
         let (mut reachable_time, _rest) =
-            LayoutVerified::<_, U32>::new_from_prefix(&mut expected[8..]).unwrap();
+            Ref::<_, U32>::new_from_prefix(&mut expected[8..]).unwrap();
         reachable_time.set(reachable_time_seconds);
         let (mut retransmit_timer, _rest) =
-            LayoutVerified::<_, U32>::new_from_prefix(&mut expected[12..]).unwrap();
+            Ref::<_, U32>::new_from_prefix(&mut expected[12..]).unwrap();
         retransmit_timer.set(retransmit_timer_seconds);
 
         let mut c = internet_checksum::Checksum::new();
@@ -1712,7 +1719,7 @@ mod tests {
         expected[2] = prefix_length;
         expected[3] = u8::from(preference) << 3;
         let (mut lifetime_seconds, _rest) =
-            LayoutVerified::<_, U32>::new_from_prefix(&mut expected[4..]).unwrap();
+            Ref::<_, U32>::new_from_prefix(&mut expected[4..]).unwrap();
         lifetime_seconds.set(route_lifetime_seconds);
         expected[8..].copy_from_slice(prefix.bytes());
 

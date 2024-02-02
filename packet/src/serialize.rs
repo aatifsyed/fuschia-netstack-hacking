@@ -14,11 +14,9 @@ use zerocopy::ByteSlice;
 
 use crate::{
     canonicalize_range, take_back, take_back_mut, take_front, take_front_mut,
-    AsFragmentedByteSlice, BufferMut, BufferView, BufferViewMut, ContiguousBuffer,
-    ContiguousBufferImpl, ContiguousBufferMut, ContiguousBufferMutImpl, EmptyBuf, FragmentedBuffer,
-    FragmentedBufferMut, FragmentedBytes, FragmentedBytesMut, GrowBuffer, GrowBufferMut,
-    ParsablePacket, ParseBuffer, ParseBufferMut, ReusableBuffer, SerializeBuffer, ShrinkBuffer,
-    TargetBuffer,
+    AsFragmentedByteSlice, Buffer, BufferView, BufferViewMut, ContiguousBuffer, EmptyBuf,
+    FragmentedBuffer, FragmentedBufferMut, FragmentedBytes, FragmentedBytesMut, GrowBuffer,
+    GrowBufferMut, ParsablePacket, ParseBuffer, ParseBufferMut, ReusableBuffer, ShrinkBuffer,
 };
 
 /// Either of two buffers.
@@ -157,13 +155,6 @@ where
 {
 }
 
-impl<A, B> ContiguousBufferMut for Either<A, B>
-where
-    A: ContiguousBufferMut,
-    B: ContiguousBufferMut,
-{
-}
-
 impl<A, B> ShrinkBuffer for Either<A, B>
 where
     A: ShrinkBuffer,
@@ -230,6 +221,13 @@ where
     A: GrowBuffer,
     B: GrowBuffer,
 {
+    #[inline]
+    fn with_parts<O, F>(&self, f: F) -> O
+    where
+        F: for<'a, 'b> FnOnce(&'a [u8], FragmentedBytes<'a, 'b>, &'a [u8]) -> O,
+    {
+        call_method_on_either!(self, with_parts, f)
+    }
     fn capacity(&self) -> usize {
         call_method_on_either!(self, capacity)
     }
@@ -250,20 +248,33 @@ where
     }
 }
 
-impl<A, B> TargetBuffer for Either<A, B>
+impl<A, B> GrowBufferMut for Either<A, B>
 where
-    A: TargetBuffer,
-    B: TargetBuffer,
+    A: GrowBufferMut,
+    B: GrowBufferMut,
 {
-    fn with_parts<O, F>(&mut self, f: F) -> O
+    fn with_parts_mut<O, F>(&mut self, f: F) -> O
     where
         F: for<'a, 'b> FnOnce(&'a mut [u8], FragmentedBytesMut<'a, 'b>, &'a mut [u8]) -> O,
     {
-        call_method_on_either!(self, with_parts, f)
+        call_method_on_either!(self, with_parts_mut, f)
     }
 
-    fn serialize<BB: PacketBuilder>(&mut self, c: PacketConstraints, builder: BB) {
-        call_method_on_either!(self, serialize, c, builder)
+    fn serialize<BB: PacketBuilder>(&mut self, builder: BB) {
+        call_method_on_either!(self, serialize, builder)
+    }
+}
+
+impl<A, B> Buffer for Either<A, B>
+where
+    A: Buffer,
+    B: Buffer,
+{
+    fn parse_with_view<'a, ParseArgs, P: ParsablePacket<&'a [u8], ParseArgs>>(
+        &'a mut self,
+        args: ParseArgs,
+    ) -> Result<(P, &'a [u8]), P::Error> {
+        call_method_on_either!(self, parse_with_view, args)
     }
 }
 
@@ -340,7 +351,10 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> Buf<B> {
     }
 }
 
-impl<B: AsRef<[u8]>> ContiguousBufferImpl for Buf<B> {}
+impl<B: AsRef<[u8]>> FragmentedBuffer for Buf<B> {
+    fragmented_buffer_method_impls!();
+}
+impl<B: AsRef<[u8]>> ContiguousBuffer for Buf<B> {}
 impl<B: AsRef<[u8]>> ShrinkBuffer for Buf<B> {
     fn shrink<R: RangeBounds<usize>>(&mut self, range: R) {
         let len = self.len();
@@ -368,6 +382,10 @@ impl<B: AsRef<[u8]>> ParseBuffer for Buf<B> {
     }
 }
 
+impl<B: AsRef<[u8]> + AsMut<[u8]>> FragmentedBufferMut for Buf<B> {
+    fragmented_buffer_mut_method_impls!();
+}
+
 impl<B: AsRef<[u8]> + AsMut<[u8]>> ParseBufferMut for Buf<B> {
     fn parse_with_mut<'a, ParseArgs, P: ParsablePacket<&'a mut [u8], ParseArgs>>(
         &'a mut self,
@@ -378,6 +396,15 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> ParseBufferMut for Buf<B> {
 }
 
 impl<B: AsRef<[u8]>> GrowBuffer for Buf<B> {
+    fn with_parts<O, F>(&self, f: F) -> O
+    where
+        F: for<'a, 'b> FnOnce(&'a [u8], FragmentedBytes<'a, 'b>, &'a [u8]) -> O,
+    {
+        let (prefix, buf) = self.buf.as_ref().split_at(self.body.start);
+        let (body, suffix) = buf.split_at(self.body.end - self.body.start);
+        let mut body = [&body[..]];
+        f(prefix, body.as_fragmented_byte_slice(), suffix)
+    }
     fn capacity(&self) -> usize {
         self.buf.as_ref().len()
     }
@@ -396,9 +423,9 @@ impl<B: AsRef<[u8]>> GrowBuffer for Buf<B> {
         self.body.end += n;
     }
 }
-impl<B: AsRef<[u8]> + AsMut<[u8]>> ContiguousBufferMutImpl for Buf<B> {}
-impl<B: AsRef<[u8]> + AsMut<[u8]>> TargetBuffer for Buf<B> {
-    fn with_parts<O, F>(&mut self, f: F) -> O
+
+impl<B: AsRef<[u8]> + AsMut<[u8]>> GrowBufferMut for Buf<B> {
+    fn with_parts_mut<O, F>(&mut self, f: F) -> O
     where
         F: for<'a, 'b> FnOnce(&'a mut [u8], FragmentedBytesMut<'a, 'b>, &'a mut [u8]) -> O,
     {
@@ -418,6 +445,18 @@ impl<B: AsRef<[u8]>> AsRef<[u8]> for Buf<B> {
 impl<B: AsMut<[u8]>> AsMut<[u8]> for Buf<B> {
     fn as_mut(&mut self) -> &mut [u8] {
         &mut self.buf.as_mut()[self.body.clone()]
+    }
+}
+
+impl<B: AsRef<[u8]>> Buffer for Buf<B> {
+    fn parse_with_view<'a, ParseArgs, P: ParsablePacket<&'a [u8], ParseArgs>>(
+        &'a mut self,
+        args: ParseArgs,
+    ) -> Result<(P, &'a [u8]), P::Error> {
+        let Self { body, ref buf } = self;
+        let body_before = body.clone();
+        let view = BufView { buf: &buf.as_ref()[body.clone()], body };
+        P::parse(view, args).map(|r| (r, &buf.as_ref()[body_before]))
     }
 }
 
@@ -526,6 +565,12 @@ pub struct PacketConstraints {
 }
 
 impl PacketConstraints {
+    /// A no-op `PacketConstraints` which does not add any constraints - there
+    /// is no header, footer, minimum body length requirement, or maximum body
+    /// length requirement.
+    pub const UNCONSTRAINED: Self =
+        Self { header_len: 0, footer_len: 0, min_body_len: 0, max_body_len: usize::MAX };
+
     /// Constructs a new `PacketConstraints`.
     ///
     /// # Panics
@@ -557,17 +602,29 @@ impl PacketConstraints {
         min_body_len: usize,
         max_body_len: usize,
     ) -> Option<PacketConstraints> {
-        // Test case 3 in test_nested_packet_builder
+        // Test case 3 in test_packet_constraints
         let header_min_body_footer_overflows = header_len
             .checked_add(min_body_len)
             .and_then(|sum| sum.checked_add(footer_len))
             .is_none();
-        // Test case 5 in test_nested_packet_builder
+        // Test case 5 in test_packet_constraints
         let max_less_than_min = max_body_len < min_body_len;
         if max_less_than_min || header_min_body_footer_overflows {
             return None;
         }
         Some(PacketConstraints { header_len, footer_len, min_body_len, max_body_len })
+    }
+
+    /// Constructs a new `PacketConstraints` with a given `max_body_len`.
+    ///
+    /// The `header_len`, `footer_len`, and `min_body_len` are all `0`.
+    #[inline]
+    pub fn with_max_body_len(max_body_len: usize) -> PacketConstraints {
+        // SAFETY:
+        // - `max_body_len >= min_body_len` by construction
+        // - `header_len + min_body_len + footer_len` is 0 and thus does not
+        //   overflow `usize`
+        PacketConstraints { header_len: 0, footer_len: 0, min_body_len: 0, max_body_len }
     }
 
     /// The number of bytes in this packet's header.
@@ -609,6 +666,52 @@ impl PacketConstraints {
     pub fn max_body_len(&self) -> usize {
         self.max_body_len
     }
+
+    /// Attempts to encapsulate `self` in `outer`.
+    ///
+    /// Upon success, `try_encapsulate` returns a `PacketConstraints` which
+    /// represents the encapsulation of `self` in `outer`. Its header length,
+    /// footer length, minimum body length, and maximum body length are set
+    /// accordingly.
+    ///
+    /// This is probably not the method you want to use; consider
+    /// [`Serializer::encapsulate`] instead.
+    pub fn try_encapsulate(&self, outer: &Self) -> Option<PacketConstraints> {
+        let inner = self;
+        // Test case 1 in test_packet_constraints
+        let header_len = inner.header_len.checked_add(outer.header_len)?;
+        // Test case 2 in test_packet_constraints
+        let footer_len = inner.footer_len.checked_add(outer.footer_len)?;
+        // This is guaranteed not to overflow by the invariants on
+        // PacketConstraint.
+        let inner_header_footer_len = inner.header_len + inner.footer_len;
+        // Note the saturating_sub here - it's OK if the inner PacketBuilder
+        // more than satisfies the outer PacketBuilder's minimum body length
+        // requirement.
+        let min_body_len = cmp::max(
+            outer.min_body_len.saturating_sub(inner_header_footer_len),
+            inner.min_body_len,
+        );
+        // Note the checked_sub here - it's NOT OK if the inner PacketBuilder
+        // exceeds the outer PacketBuilder's maximum body length requirement.
+        //
+        // Test case 4 in test_packet_constraints
+        let max_body_len =
+            cmp::min(outer.max_body_len.checked_sub(inner_header_footer_len)?, inner.max_body_len);
+        // It's still possible that `min_body_len > max_body_len` or that
+        // `header_len + min_body_len + footer_len` overflows `usize`; `try_new`
+        // checks those constraints for us.
+        PacketConstraints::try_new(header_len, footer_len, min_body_len, max_body_len)
+    }
+}
+
+/// The target buffers into which [`PacketBuilder::serialize`] serializes its
+/// header and footer.
+pub struct SerializeTarget<'a> {
+    #[allow(missing_docs)]
+    pub header: &'a mut [u8],
+    #[allow(missing_docs)]
+    pub footer: &'a mut [u8],
 }
 
 /// A builder capable of serializing a packet's headers and footers.
@@ -633,17 +736,20 @@ pub trait PacketBuilder {
 
     /// Serializes this packet into an existing buffer.
     ///
-    /// `serialize` is called with a [`SerializeBuffer`] which provides access
-    /// to the parts of a buffer corresponding to the header, body, and footer
-    /// of this packet. The buffer's body is initialized with the body to be
-    /// encapsulated, and `serialize` is responsible for serializing the header
-    /// and footer into the appropriate sections of the buffer. The caller is
-    /// responsible for ensuring that the body satisfies both the minimum and
-    /// maximum body length requirements, possibly by adding padding or
+    /// *This method is usually called by this crate during the serialization of
+    /// a [`Serializer`], not directly by the user.*
+    ///
+    /// # Preconditions
+    ///
+    /// The caller is responsible for initializing `body` with the body to be
+    /// encapsulated, and for ensuring that the body satisfies both the minimum
+    /// and maximum body length requirements, possibly by adding padding or by
     /// truncating the body.
     ///
-    /// This method is usually called from
-    /// [`NestedPacketBuilder::serialize_into`], not directly by the user.
+    /// # Postconditions
+    ///
+    /// `serialize` is responsible for serializing its header and footer into
+    /// `target.header` and `target.footer` respectively.
     ///
     /// # Security
     ///
@@ -653,157 +759,10 @@ pub trait PacketBuilder {
     ///
     /// # Panics
     ///
-    /// May panic if the `SerializeBuffer`'s header or footer are not large
-    /// enough to fit the packet's header and footer, or if the body does not
-    /// satisfy the minimum or maximum body length requirements.
-    fn serialize(&self, buffer: &mut SerializeBuffer<'_, '_>);
-}
-
-/// One or more nested [`PacketBuilder`]s.
-///
-/// A `NestedPacketBuilder` represents one or more `PacketBuilder`s nested
-/// inside of each other. Two `NestedPacketBuilder`s, `a` and `b`, can be
-/// composed by calling `a.encapsulate(b)`. The resulting `NestedPacketBuilder`
-/// has a header comprising `b`'s header followed by `a`'s header, and has a
-/// footer comprising `a`'s footer followed by `b`'s footer. It also has minimum
-/// and maximum body length requirements which are the composition of those of
-/// `a` and `b`. See [`encapsulate`] for more details.
-///
-/// [`encapsulate`]: NestedPacketBuilder::encapsulate
-pub trait NestedPacketBuilder {
-    /// Gets the constraints for this `NestedPacketBuilder`.
-    ///
-    /// If `constraints` returns `None`, it means that a valid
-    /// [`PacketConstraints`] cannot be constructed. Since
-    /// `NestedPacketBuilder`s can be nested, multiple valid
-    /// `NestedPacketBuilder`s can nest to create an invalid
-    /// `NestedPacketBuilder`. This can happen if an inner
-    /// `NestedPacketBuilder`'s headers and footers take up more space than an
-    /// outer `NestedPacketBuilder`'s maximum body length, so the maximum body
-    /// length of this `NestedPacketBuilder` is technically negative. It can
-    /// also happen if the header and footer lengths, when summed, overflow
-    /// `usize`. In either case, the `PacketConstraints` type cannot represent
-    /// the constraints, and no body exists which would satisfy those
-    /// constraints (a satisfying body would need to have negative length).
-    /// Thus, the correct behavior is to interpret a `None` value as implying
-    /// that constraints are violated.
-    ///
-    /// If `constraints` returns `None`, the caller must not call
-    /// [`serialize_into`], or risk unspecified behavior (including possibly a
-    /// panic).
-    ///
-    /// [`serialize_into`]: NestedPacketBuilder::serialize_into
-    fn try_constraints(&self) -> Option<PacketConstraints>;
-
-    /// Serializes this `NestedPacketBuilder` into a buffer.
-    ///
-    /// `serialize_into` takes a buffer containing a body, and serializes this
-    /// `NestedPacketBuilder`'s headers and footers before and after that body
-    /// respectively. When `serialize_into` returns, the buffer's body has been
-    /// expanded to include the newly-serialized headers and footers.
-    ///
-    /// If the provided body is smaller than this `NestedPacketBuilder`'s
-    /// minimum body length requirement, `serialize_into` will add padding after
-    /// the body in order to meet that requriement. If this
-    /// `NestedPacketBuilder` comprises multiple other `NestedPacketBuilder`s
-    /// with their own minimum body length requirements, then internal padding
-    /// may be added between footers in order to meet those requirements. In
-    /// particular, padding is always added after the body of the packet with
-    /// that requirement (as opposed to after the body of an encapsulated
-    /// packet).
-    ///
-    /// Callers should *not* add their own post-body padding! The minimum body
-    /// length requirement might come from a `NestedPacketBuilder` which is not
-    /// the innermost one, in which case padding belongs after at least one of
-    /// the footers, and adding padding directly after the body would be
-    /// incorrect. As described in the previous paragraph, `serialize_into` will
-    /// take care of putting padding in the right place.
-    ///
-    /// # Security
-    ///
-    /// Any added padding will be zeroed in order to ensure that the contents of
-    /// another packet previously stored in the same buffer do not leak.
-    ///
-    /// # Panics
-    ///
-    /// May panic if `buffer` doesn't have enough prefix and suffix space to
-    /// hold the headers and footers. In particular, if this
-    /// `NestedPacketBuilder` has [`PacketConstraints`] `c`, then `buffer` must
-    /// satisfy the following requirements:
-    /// - `buffer.prefix_len() >= c.header_len()`
-    /// - `buffer.suffix_len() >= c.footer_len()`
-    /// - `buffer.len() <= c.max_body_len()`
-    /// - If `padding = c.min_body_len().saturating_sub(buffer.len())`, then
-    ///   `buffer.suffix_len() >= padding + c.footer_len()`
-    ///
-    /// Note that the `PacketConstraints` type has certain invariants that make
-    /// it easier for implementers to satisfy these preconditions.
-    ///
-    /// `serialize_into` may exhibit unspecified behavior (including possibly
-    /// panicking) if `self.try_constraints()` returns `None`. In order to avoid
-    /// a panic, the caller must call that method first, and only call
-    /// `serialize_into` if it returns `Some`.
-    fn serialize_into<B: TargetBuffer>(&self, buffer: &mut B);
-
-    /// Encapsulates this `NestedPacketBuilder` inside of another one.
-    ///
-    /// If `a` and `b` are `NestedPacketBuilder`s with [`PacketConstraints`]
-    /// `ac` and `bc`, then `a.encapsulate(b)` produces a `NestedPacketBuilder`
-    /// with the following properties:
-    /// - Its header is equivalent to `b`'s header followed by `a`'s header, and
-    ///   has length `bc.header_len() + ac.header_len()`
-    /// - Its footer is equivalent to `a`'s footer followed by `b`'s footer, and
-    ///   has length `ac.footer_len() + bc.footer_len()`
-    /// - Its minimum body length requirement is
-    ///   `core::cmp::max(ac.min_body_len(), bc.min_body_len() -
-    ///   (ac.header_len() + ac.footer_len()))`
-    /// - Its maximum body length requirement is
-    ///   `core::cmp::min(ac.max_body_len(), bc.max_body_len() -
-    ///   (ac.header_len() + ac.footer_len()))`
-    ///
-    /// Note that `a` and `b` having valid `PacketConstraints` does *not* imply
-    /// that `a.encapsulate(b)` will as well. This could be for one of the
-    /// following reasons:
-    /// - `b` has a maximum body length requirement which is exceeded by `a`'s
-    ///   headers and footers alone (without considering further space occupied
-    ///   by a body)
-    /// - `b` has a maximum body length requirement which is exceeded by the sum
-    ///   of `a`'s header and footers and `a`'s minimum body length requirement
-    /// - The `PacketConstraints` would have values that overflow `usize`, such
-    ///   as `b`'s header length plus `a`'s header length
-    ///
-    /// [`serialize_into`]: NestedPacketBuilder::serialize_into
-    #[inline]
-    fn encapsulate<O: NestedPacketBuilder>(self, outer: O) -> Nested<Self, O>
-    where
-        Self: Sized,
-    {
-        Nested { inner: self, outer }
-    }
-
-    /// Constructs a new `NestedPacketBuilder` with an additional size limit
-    /// constraint
-    ///
-    /// The returned `NestedPacketBuilder` will have a maximum body length
-    /// constraint equal to the minimum of its original maximum body length
-    /// constraint and `limit`.
-    #[inline]
-    fn with_size_limit(self, limit: usize) -> LimitedSizePacketBuilder<Self>
-    where
-        Self: Sized,
-    {
-        LimitedSizePacketBuilder { limit, inner: self }
-    }
-}
-
-impl<PB: PacketBuilder> NestedPacketBuilder for PB {
-    fn try_constraints(&self) -> Option<PacketConstraints> {
-        Some(self.constraints())
-    }
-
-    fn serialize_into<B: TargetBuffer>(&self, buffer: &mut B) {
-        buffer.serialize(self.constraints(), self);
-    }
+    /// May panic if the `target.header` or `target.footer` are not large enough
+    /// to fit the packet's header and footer respectively, or if the body does
+    /// not satisfy the minimum or maximum body length requirements.
+    fn serialize(&self, target: &mut SerializeTarget<'_>, body: FragmentedBytesMut<'_, '_>);
 }
 
 impl<'a, B: PacketBuilder> PacketBuilder for &'a B {
@@ -812,8 +771,8 @@ impl<'a, B: PacketBuilder> PacketBuilder for &'a B {
         B::constraints(self)
     }
     #[inline]
-    fn serialize(&self, buffer: &mut SerializeBuffer<'_, '_>) {
-        B::serialize(self, buffer)
+    fn serialize(&self, target: &mut SerializeTarget<'_>, body: FragmentedBytesMut<'_, '_>) {
+        B::serialize(self, target, body)
     }
 }
 
@@ -823,30 +782,25 @@ impl<'a, B: PacketBuilder> PacketBuilder for &'a mut B {
         B::constraints(self)
     }
     #[inline]
-    fn serialize(&self, buffer: &mut SerializeBuffer<'_, '_>) {
-        B::serialize(self, buffer)
+    fn serialize(&self, target: &mut SerializeTarget<'_>, body: FragmentedBytesMut<'_, '_>) {
+        B::serialize(self, target, body)
     }
 }
 
 impl PacketBuilder for () {
     #[inline]
     fn constraints(&self) -> PacketConstraints {
-        PacketConstraints {
-            header_len: 0,
-            footer_len: 0,
-            min_body_len: 0,
-            max_body_len: usize::MAX,
-        }
+        PacketConstraints::UNCONSTRAINED
     }
     #[inline]
-    fn serialize(&self, _buffer: &mut SerializeBuffer<'_, '_>) {}
+    fn serialize(&self, _target: &mut SerializeTarget<'_>, _body: FragmentedBytesMut<'_, '_>) {}
 }
 
 impl PacketBuilder for Never {
     fn constraints(&self) -> PacketConstraints {
         match *self {}
     }
-    fn serialize(&self, _buffer: &mut SerializeBuffer<'_, '_>) {}
+    fn serialize(&self, _target: &mut SerializeTarget<'_>, _body: FragmentedBytesMut<'_, '_>) {}
 }
 
 /// One object encapsulated in another one.
@@ -880,109 +834,24 @@ impl<I, O> Nested<I, O> {
     }
 }
 
-impl<I: NestedPacketBuilder, O: NestedPacketBuilder> NestedPacketBuilder for Nested<I, O> {
-    #[inline]
-    fn try_constraints(&self) -> Option<PacketConstraints> {
-        let inner = self.inner.try_constraints()?;
-        let outer = self.outer.try_constraints()?;
-
-        // Test case 1 in test_nested_packet_builder
-        let header_len = inner.header_len.checked_add(outer.header_len)?;
-        // Test case 2 in test_nested_packet_builder
-        let footer_len = inner.footer_len.checked_add(outer.footer_len)?;
-        // This is guaranteed not to overflow by the invariants on
-        // PacketConstraint.
-        let inner_header_footer_len = inner.header_len + inner.footer_len;
-        // Note the saturating_sub here - it's OK if the inner PacketBuilder
-        // more than satisfies the outer PacketBuilder's minimum body length
-        // requirement.
-        let min_body_len = cmp::max(
-            outer.min_body_len.saturating_sub(inner_header_footer_len),
-            inner.min_body_len,
-        );
-        // Note the checked_sub here - it's NOT OK if the inner PacketBuilder
-        // exceeds the outer PacketBuilder's maximum body length requirement.
-        //
-        // Test case 4 in test_nested_packet_builder
-        let max_body_len =
-            cmp::min(outer.max_body_len.checked_sub(inner_header_footer_len)?, inner.max_body_len);
-        // It's still possible that `min_body_len > max_body_len` or that
-        // `header_len + min_body_len + footer_len` overflows `usize`; `try_new`
-        // checks those constraints for us.
-        PacketConstraints::try_new(header_len, footer_len, min_body_len, max_body_len)
-    }
-
-    #[inline]
-    fn serialize_into<B: TargetBuffer>(&self, buffer: &mut B) {
-        // `serialize_into` is required to serialize padding, and in particular,
-        // to serialize it in the right place, immediately following the body of
-        // the packet which imposes the minimum body length requirement. This
-        // happens naturally as a consequence of the fact that the
-        // implementation of `NestedPacketBuilder` for `PB: PacketBuilder` adds
-        // its own padding. Inner `PacketBuilder`s which do not have a minimum
-        // body length requirement will not add padding and, when the
-        // `PacketBuilder` with the minimum body length requirement is reached,
-        // padding will still be required (assuming the minimum isn't already
-        // satisfied by the original body and headers/footers), and that
-        // `PacketBuilder`'s `serialize_into` implementation will add the
-        // padding at that point.
-        self.inner.serialize_into(buffer);
-        self.outer.serialize_into(buffer);
-    }
-}
-
-// It would be great to just do `impl<'a, PB: NestedPacketBuilder>
-// NestedPacketBuilder for &'a PB`, but it would conflict with the blanket impl
-// for `PB: PacketBuilder`. This replaces that impl. Note that it's not a big
-// deal that we don't have that impl because the one that really matters is
-// `PacketBuilder for &PB` where `PB: PacketBuilder` because users of this crate
-// only implement the `PacketBuilder` trait.
-struct RefNestedPacketBuilder<'a, PB>(&'a PB);
-
-impl<'a, PB: NestedPacketBuilder> NestedPacketBuilder for RefNestedPacketBuilder<'a, PB> {
-    fn try_constraints(&self) -> Option<PacketConstraints> {
-        self.0.try_constraints()
-    }
-
-    fn serialize_into<B: TargetBuffer>(&self, buffer: &mut B) {
-        self.0.serialize_into(buffer)
-    }
-}
-
-/// A [`PacketBuilder`] with a specific maximum packet length constraint.
+/// A [`PacketBuilder`] which has no header or footer, but which imposes a
+/// maximum body length constraint.
 ///
 /// `LimitedSizePacketBuilder`s are constructed using the
-/// [`NestedPacketBuilder::with_size_limit`] method.
+/// [`Serializer::with_size_limit`] method.
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(test, derive(Eq, PartialEq))]
-pub struct LimitedSizePacketBuilder<B> {
-    limit: usize,
-    inner: B,
+pub struct LimitedSizePacketBuilder {
+    /// The maximum body length.
+    pub limit: usize,
 }
 
-impl<B> LimitedSizePacketBuilder<B> {
-    /// Consumes this `LimitedSizePacketBuilder` and returns the inner `PacketBuilder`.
-    #[inline]
-    pub fn into_inner(self) -> B {
-        self.inner
-    }
-}
-
-impl<PB: NestedPacketBuilder> NestedPacketBuilder for LimitedSizePacketBuilder<PB> {
-    #[inline]
-    fn try_constraints(&self) -> Option<PacketConstraints> {
-        let mut c = self.inner.try_constraints()?;
-        // This is guaranteed not to overflow by the invariants on
-        // PacketConstraint.
-        let header_footer_len = c.header_len + c.footer_len;
-        c.max_body_len = cmp::min(self.limit.checked_sub(header_footer_len)?, c.max_body_len);
-        Some(c)
+impl PacketBuilder for LimitedSizePacketBuilder {
+    fn constraints(&self) -> PacketConstraints {
+        PacketConstraints::with_max_body_len(self.limit)
     }
 
-    #[inline]
-    fn serialize_into<B: TargetBuffer>(&self, buffer: &mut B) {
-        self.inner.serialize_into(buffer)
-    }
+    fn serialize(&self, _target: &mut SerializeTarget<'_>, _body: FragmentedBytesMut<'_, '_>) {}
 }
 
 /// A builder capable of serializing packets - which do not encapsulate other
@@ -1044,7 +913,7 @@ pub trait InnerPacketBuilder {
     ///
     /// `buffer` will have its body shrunk to be zero bytes before the
     /// `InnerSerializer` is constructed.
-    fn into_serializer_with<B: BufferMut>(self, mut buffer: B) -> InnerSerializer<Self, B>
+    fn into_serializer_with<B: ShrinkBuffer>(self, mut buffer: B) -> InnerSerializer<Self, B>
     where
         Self: Sized,
     {
@@ -1366,15 +1235,13 @@ pub fn try_reuse_buffer<B: GrowBufferMut + ShrinkBuffer>(
     }
 }
 
-/// All types which implement `BufferAlloc<O>` also implement `BufferProvider<I,
-/// Either<I, O>>` for all `I` where `I` and `O` both implement [`BufferMut`].
-///
-/// Note that, if `I` and `O` are the same type, calling methods on `Either<I,
-/// O>` will often be just as fast as calling methods on `I`/`O` itself since
-/// Rust can optimize out branching on which enum variant is present. However,
-/// in this case, an impl of `BufferProvider<I, I>` is also provided.
+/// Provides an implementation of [`BufferProvider`] from a [`BufferAlloc`] `A`
+/// that attempts to reuse the input buffer and falls back to the allocator if
+/// the input buffer can't be reused.
+pub struct MaybeReuseBufferProvider<A>(pub A);
+
 impl<I: ReusableBuffer, O: ReusableBuffer, A: BufferAlloc<O>> BufferProvider<I, Either<I, O>>
-    for A
+    for MaybeReuseBufferProvider<A>
 {
     type Error = A::Error;
 
@@ -1384,8 +1251,9 @@ impl<I: ReusableBuffer, O: ReusableBuffer, A: BufferAlloc<O>> BufferProvider<I, 
         body: usize,
         suffix: usize,
     ) -> Result<Either<I, O>, Self::Error> {
+        let Self(alloc) = self;
         let need_capacity = prefix + body + suffix;
-        BufferAlloc::alloc(self, need_capacity).map(|mut buf| {
+        BufferAlloc::alloc(alloc, need_capacity).map(|mut buf| {
             buf.shrink(prefix..(prefix + body));
             Either::B(buf)
         })
@@ -1434,9 +1302,7 @@ impl<I: ReusableBuffer, O: ReusableBuffer, A: BufferAlloc<O>> BufferProvider<I, 
     }
 }
 
-/// All types which implement `BufferAlloc<B>` also implement `BufferProvider<B,
-/// B>` where `B` implements [`GrowBufferMut`] and [`ShrinkBuffer`].
-impl<B: ReusableBuffer, A: BufferAlloc<B>> BufferProvider<B, B> for A {
+impl<B: ReusableBuffer, A: BufferAlloc<B>> BufferProvider<B, B> for MaybeReuseBufferProvider<A> {
     type Error = A::Error;
 
     fn alloc_no_reuse(self, prefix: usize, body: usize, suffix: usize) -> Result<B, Self::Error> {
@@ -1456,6 +1322,34 @@ impl<B: ReusableBuffer, A: BufferAlloc<B>> BufferProvider<B, B> for A {
     fn reuse_or_realloc(self, buffer: B, prefix: usize, suffix: usize) -> Result<B, (A::Error, B)> {
         BufferProvider::<B, Either<B, B>>::reuse_or_realloc(self, buffer, prefix, suffix)
             .map(Either::into_inner)
+    }
+}
+
+/// Provides an implementation of [`BufferProvider`] from a [`BufferAlloc`] `A`
+/// that never attempts to reuse the input buffer, and always create a new
+/// buffer from the allocator `A`.
+pub struct NoReuseBufferProvider<A>(pub A);
+
+impl<I: FragmentedBuffer, O: ReusableBuffer, A: BufferAlloc<O>> BufferProvider<I, O>
+    for NoReuseBufferProvider<A>
+{
+    type Error = A::Error;
+
+    fn alloc_no_reuse(self, prefix: usize, body: usize, suffix: usize) -> Result<O, A::Error> {
+        let Self(alloc) = self;
+        alloc.alloc(prefix + body + suffix).map(|mut b| {
+            b.shrink(prefix..prefix + body);
+            b
+        })
+    }
+
+    fn reuse_or_realloc(self, buffer: I, prefix: usize, suffix: usize) -> Result<O, (A::Error, I)> {
+        BufferProvider::<I, O>::alloc_no_reuse(self, prefix, buffer.len(), suffix)
+            .map(|mut b| {
+                b.copy_from(&buffer);
+                b
+            })
+            .map_err(|e| (e, buffer))
     }
 }
 
@@ -1479,9 +1373,9 @@ pub trait Serializer: Sized {
     /// it and allocating a new one.
     ///
     /// [`encapsulate`]: Serializer::encapsulate
-    fn serialize<B: TargetBuffer, PB: NestedPacketBuilder, P: BufferProvider<Self::Buffer, B>>(
+    fn serialize<B: GrowBufferMut, P: BufferProvider<Self::Buffer, B>>(
         self,
-        outer: PB,
+        outer: PacketConstraints,
         provider: P,
     ) -> Result<B, (SerializeError<P::Error>, Self)>;
 
@@ -1502,14 +1396,14 @@ pub trait Serializer: Sized {
     /// [`serialize`]: Serializer::serialize
     #[inline]
     #[allow(clippy::type_complexity)]
-    fn serialize_vec<PB: NestedPacketBuilder>(
+    fn serialize_vec(
         self,
-        outer: PB,
+        outer: PacketConstraints,
     ) -> Result<Either<Self::Buffer, Buf<Vec<u8>>>, (SerializeError<Never>, Self)>
     where
         Self::Buffer: ReusableBuffer,
     {
-        self.serialize(outer, new_buf_vec)
+        self.serialize(outer, MaybeReuseBufferProvider(new_buf_vec))
     }
 
     /// Serializes this `Serializer`, failing if the existing buffer is not
@@ -1526,22 +1420,24 @@ pub trait Serializer: Sized {
     ///
     /// [`serialize`]: Serializer::serialize
     #[inline]
-    fn serialize_no_alloc<PB: NestedPacketBuilder>(
+    fn serialize_no_alloc(
         self,
-        outer: PB,
+        outer: PacketConstraints,
     ) -> Result<Self::Buffer, (SerializeError<BufferTooShortError>, Self)>
     where
         Self::Buffer: ReusableBuffer,
     {
-        self.serialize(outer, ()).map(Either::into_a).map_err(|(err, slf)| {
-            (
-                match err {
-                    SerializeError::Alloc(()) => BufferTooShortError.into(),
-                    SerializeError::SizeLimitExceeded => SerializeError::SizeLimitExceeded,
-                },
-                slf,
-            )
-        })
+        self.serialize(outer, MaybeReuseBufferProvider(())).map(Either::into_a).map_err(
+            |(err, slf)| {
+                (
+                    match err {
+                        SerializeError::Alloc(()) => BufferTooShortError.into(),
+                        SerializeError::SizeLimitExceeded => SerializeError::SizeLimitExceeded,
+                    },
+                    slf,
+                )
+            },
+        )
     }
 
     /// Serializes this `Serializer` as the outermost packet.
@@ -1553,11 +1449,11 @@ pub trait Serializer: Sized {
     ///
     /// [`serialize`]: Serializer::serialize
     #[inline]
-    fn serialize_outer<B: TargetBuffer, P: BufferProvider<Self::Buffer, B>>(
+    fn serialize_outer<B: GrowBufferMut, P: BufferProvider<Self::Buffer, B>>(
         self,
         provider: P,
     ) -> Result<B, (SerializeError<P::Error>, Self)> {
-        self.serialize((), provider)
+        self.serialize(PacketConstraints::UNCONSTRAINED, provider)
     }
 
     /// Serializes this `Serializer` as the outermost packet, allocating a
@@ -1578,7 +1474,7 @@ pub trait Serializer: Sized {
     where
         Self::Buffer: ReusableBuffer,
     {
-        self.serialize_vec(())
+        self.serialize_vec(PacketConstraints::UNCONSTRAINED)
     }
 
     /// Serializes this `Serializer` as the outermost packet, failing if the
@@ -1597,7 +1493,7 @@ pub trait Serializer: Sized {
     where
         Self::Buffer: ReusableBuffer,
     {
-        self.serialize_no_alloc(())
+        self.serialize_no_alloc(PacketConstraints::UNCONSTRAINED)
     }
 
     /// Encapsulates this `Serializer` in another packet, producing a new
@@ -1607,7 +1503,7 @@ pub trait Serializer: Sized {
     /// produces a new `Serializer` which describes encapsulating this one in
     /// the packet described by `outer`.
     #[inline]
-    fn encapsulate<B: NestedPacketBuilder>(self, outer: B) -> Nested<Self, B> {
+    fn encapsulate<B>(self, outer: B) -> Nested<Self, B> {
         Nested { inner: self, outer }
     }
 
@@ -1620,8 +1516,8 @@ pub trait Serializer: Sized {
     /// request at this layer would exceed the limit. It has no effect on
     /// headers or footers added by encapsulating layers outside of this one.
     #[inline]
-    fn with_size_limit(self, limit: usize) -> Nested<Self, LimitedSizePacketBuilder<()>> {
-        self.encapsulate(LimitedSizePacketBuilder { limit, inner: () })
+    fn with_size_limit(self, limit: usize) -> Nested<Self, LimitedSizePacketBuilder> {
+        self.encapsulate(LimitedSizePacketBuilder { limit })
     }
 }
 
@@ -1646,9 +1542,9 @@ impl<I: InnerPacketBuilder, B: GrowBuffer + ShrinkBuffer> Serializer for InnerSe
 
     #[inline]
     #[allow(clippy::type_complexity)]
-    fn serialize<BB: TargetBuffer, PB: NestedPacketBuilder, P: BufferProvider<B, BB>>(
+    fn serialize<BB: GrowBufferMut, P: BufferProvider<B, BB>>(
         self,
-        outer: PB,
+        outer: PacketConstraints,
         provider: P,
     ) -> Result<BB, (SerializeError<P::Error>, InnerSerializer<I, B>)> {
         // A wrapper for InnerPacketBuilders which implements PacketBuilder by
@@ -1663,26 +1559,28 @@ impl<I: InnerPacketBuilder, B: GrowBuffer + ShrinkBuffer> Serializer for InnerSe
                 PacketConstraints::new(self.0.bytes_len(), 0, 0, usize::MAX)
             }
 
-            fn serialize(&self, buffer: &mut SerializeBuffer<'_, '_>) {
+            fn serialize(
+                &self,
+                target: &mut SerializeTarget<'_>,
+                _body: FragmentedBytesMut<'_, '_>,
+            ) {
                 // Note that the body might be non-empty if an outer
                 // PacketBuilder added a minimum body length constraint that
                 // required padding.
-                debug_assert_eq!(buffer.header().len(), self.0.bytes_len());
-                debug_assert_eq!(buffer.footer().len(), 0);
+                debug_assert_eq!(target.header.len(), self.0.bytes_len());
+                debug_assert_eq!(target.footer.len(), 0);
 
-                InnerPacketBuilder::serialize(&self.0, buffer.header());
+                InnerPacketBuilder::serialize(&self.0, target.header);
             }
         }
 
         let pb = InnerPacketBuilderWrapper(self.inner);
         debug_assert_eq!(self.buffer.len(), 0);
-        match self.buffer.encapsulate(&pb).serialize(outer, provider) {
-            Ok(buf) => Ok(buf),
-            Err((err, buffer)) => {
-                let buffer = buffer.into_inner();
-                Err((err, InnerSerializer { inner: pb.0, buffer }))
-            }
-        }
+        self.buffer.encapsulate(pb).serialize(outer, provider).map_err(
+            |(err, Nested { inner: buffer, outer: pb })| {
+                (err, InnerSerializer { inner: pb.0, buffer })
+            },
+        )
     }
 }
 
@@ -1690,9 +1588,9 @@ impl<B: GrowBuffer + ShrinkBuffer> Serializer for B {
     type Buffer = B;
 
     #[inline]
-    fn serialize<BB: TargetBuffer, PB: NestedPacketBuilder, P: BufferProvider<Self::Buffer, BB>>(
+    fn serialize<BB: GrowBufferMut, P: BufferProvider<Self::Buffer, BB>>(
         self,
-        outer: PB,
+        outer: PacketConstraints,
         provider: P,
     ) -> Result<BB, (SerializeError<P::Error>, Self)> {
         TruncatingSerializer::new(self, TruncateDirection::NoTruncating)
@@ -1712,9 +1610,9 @@ pub enum EitherSerializer<A, B> {
 impl<A: Serializer, B: Serializer<Buffer = A::Buffer>> Serializer for EitherSerializer<A, B> {
     type Buffer = A::Buffer;
 
-    fn serialize<TB: TargetBuffer, PB: NestedPacketBuilder, P: BufferProvider<Self::Buffer, TB>>(
+    fn serialize<TB: GrowBufferMut, P: BufferProvider<Self::Buffer, TB>>(
         self,
-        outer: PB,
+        outer: PacketConstraints,
         provider: P,
     ) -> Result<TB, (SerializeError<P::Error>, Self)> {
         match self {
@@ -1770,18 +1668,17 @@ impl<B> TruncatingSerializer<B> {
 impl<B: GrowBuffer + ShrinkBuffer> Serializer for TruncatingSerializer<B> {
     type Buffer = B;
 
-    fn serialize<BB: TargetBuffer, PB: NestedPacketBuilder, P: BufferProvider<B, BB>>(
+    fn serialize<BB: GrowBufferMut, P: BufferProvider<B, BB>>(
         mut self,
-        outer: PB,
+        outer: PacketConstraints,
         provider: P,
     ) -> Result<BB, (SerializeError<P::Error>, Self)> {
-        let c = match outer.try_constraints() {
-            Some(c) => c,
-            None => return Err((SerializeError::SizeLimitExceeded, self)),
-        };
         let original_len = self.buffer.len();
-        let excess_bytes =
-            if original_len > c.max_body_len { Some(original_len - c.max_body_len) } else { None };
+        let excess_bytes = if original_len > outer.max_body_len {
+            Some(original_len - outer.max_body_len)
+        } else {
+            None
+        };
         if let Some(excess_bytes) = excess_bytes {
             match self.direction {
                 TruncateDirection::DiscardFront => self.buffer.shrink_front(excess_bytes),
@@ -1792,17 +1689,18 @@ impl<B: GrowBuffer + ShrinkBuffer> Serializer for TruncatingSerializer<B> {
             }
         }
 
-        let padding = c.min_body_len().saturating_sub(self.buffer.len());
+        let padding = outer.min_body_len().saturating_sub(self.buffer.len());
 
         // At this point, the body and padding MUST fit within the limit. Note
         // that PacketConstraints guarantees that min_body_len <= max_body_len,
         // so the padding can't cause this assertion to fail.
-        debug_assert!(self.buffer.len() + padding <= c.max_body_len());
-        match provider.reuse_or_realloc(self.buffer, c.header_len(), padding + c.footer_len()) {
-            Ok(mut buffer) => {
-                outer.serialize_into(&mut buffer);
-                Ok(buffer)
-            }
+        debug_assert!(self.buffer.len() + padding <= outer.max_body_len());
+        match provider.reuse_or_realloc(
+            self.buffer,
+            outer.header_len(),
+            padding + outer.footer_len(),
+        ) {
+            Ok(buffer) => Ok(buffer),
             Err((err, mut buffer)) => {
                 // Undo the effects of shrinking the buffer so that the buffer
                 // we return is unmodified from its original (which is required
@@ -1824,24 +1722,24 @@ impl<B: GrowBuffer + ShrinkBuffer> Serializer for TruncatingSerializer<B> {
     }
 }
 
-impl<I: Serializer, O: NestedPacketBuilder> Serializer for Nested<I, O> {
+impl<I: Serializer, O: PacketBuilder> Serializer for Nested<I, O> {
     type Buffer = I::Buffer;
 
     #[inline]
-    fn serialize<B: TargetBuffer, PB: NestedPacketBuilder, P: BufferProvider<I::Buffer, B>>(
+    fn serialize<B: GrowBufferMut, P: BufferProvider<I::Buffer, B>>(
         self,
-        outer: PB,
+        outer: PacketConstraints,
         provider: P,
     ) -> Result<B, (SerializeError<P::Error>, Self)> {
-        // We use `RefNestedPacketBuilder` here so that the call to `serialize`
-        // doesn't consume `self.outer` by value. If it did, we'd have to way of
-        // getting it back in the event of an error (when we need to reconstruct
-        // `self` to return).
-        match self.inner.serialize(
-            NestedPacketBuilder::encapsulate(RefNestedPacketBuilder(&self.outer), outer),
-            provider,
-        ) {
-            Ok(buf) => Ok(buf),
+        let Some(outer) = self.outer.constraints().try_encapsulate(&outer) else {
+            return Err((SerializeError::SizeLimitExceeded, self));
+        };
+
+        match self.inner.serialize(outer, provider) {
+            Ok(mut buf) => {
+                buf.serialize(&self.outer);
+                Ok(buf)
+            }
             Err((err, inner)) => Err((err, inner.encapsulate(self.outer))),
         }
     }
@@ -1850,7 +1748,7 @@ impl<I: Serializer, O: NestedPacketBuilder> Serializer for Nested<I, O> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Buffer;
+    use crate::{Buffer, BufferMut};
     use std::fmt::Debug;
     use test_case::test_case;
 
@@ -1894,16 +1792,13 @@ mod tests {
             )
         }
 
-        fn serialize(&self, buffer: &mut SerializeBuffer<'_, '_>) {
-            // // `serialize` is allowed to panic if called on a `PacketBuilder`
-            // // with invalid constraints.
-            // assert!(self.try_constraints().is_some());
-            assert_eq!(buffer.header().len(), self.header_len);
-            assert_eq!(buffer.footer().len(), self.footer_len);
-            assert!(buffer.body().len() >= self.min_body_len);
-            assert!(buffer.body().len() <= self.max_body_len);
-            fill(buffer.header(), 0xFF);
-            fill(buffer.footer(), 0xFE);
+        fn serialize(&self, target: &mut SerializeTarget<'_>, body: FragmentedBytesMut<'_, '_>) {
+            assert_eq!(target.header.len(), self.header_len);
+            assert_eq!(target.footer.len(), self.footer_len);
+            assert!(body.len() >= self.min_body_len);
+            assert!(body.len() <= self.max_body_len);
+            fill(target.header, 0xFF);
+            fill(target.footer, 0xFE);
         }
     }
 
@@ -1938,7 +1833,7 @@ mod tests {
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     struct VerifyingSerializer<S> {
         ser: S,
-        // Is the inner Serializer a truncating (a TruncatingSerializer with
+        // Is the inner Serializer truncating (a TruncatingSerializer with
         // TruncateDirection::DiscardFront or DiscardBack)?
         truncating: bool,
     }
@@ -1949,43 +1844,39 @@ mod tests {
     {
         type Buffer = S::Buffer;
 
-        fn serialize<
-            B: TargetBuffer,
-            PB: NestedPacketBuilder,
-            P: BufferProvider<Self::Buffer, B>,
-        >(
+        fn serialize<B: GrowBufferMut, P: BufferProvider<Self::Buffer, B>>(
             self,
-            outer: PB,
+            outer: PacketConstraints,
             provider: P,
         ) -> Result<B, (SerializeError<P::Error>, Self)> {
             let orig = self.ser.clone();
 
             // How long is the packet if we serialize it without the outer
             // PacketBuilder?
-            let inner_len = match self.clone().ser.serialize_vec_outer() {
-                Ok(buf) => buf.len(),
-                Err((err, ser)) => {
+            let inner_len = self.clone().ser.serialize_vec_outer().map(|buf| buf.len()).map_err(
+                |(err, ser)| {
                     // If serialization fails, the original Serializer should be
                     // unmodified.
                     assert_eq!(ser, orig);
-                    return Err((err.into(), ser.into_verifying(self.truncating)));
-                }
-            };
-            let outer_constraints = outer.try_constraints();
-            let should_exceed_size_limit = outer_constraints
-                .map(|c| c.max_body_len() < inner_len && !self.truncating)
-                .unwrap_or(true);
+                    (err.into(), ser.into_verifying(self.truncating))
+                },
+            )?;
+            let should_exceed_size_limit = outer.max_body_len() < inner_len && !self.truncating;
 
             let res = self.ser.serialize(outer, provider);
             match res {
                 Ok(buf) => {
-                    let c = outer_constraints.unwrap();
-                    // Since serialization has succeeded, we know that either
-                    // inner_len <= c.max_body_len(), or that the body was
-                    // truncated to fit.
-                    let body_len =
-                        cmp::min(cmp::max(inner_len, c.min_body_len()), c.max_body_len());
-                    assert_eq!(buf.len(), c.header_len() + body_len + c.footer_len());
+                    assert!(buf.prefix_len() >= outer.header_len());
+                    assert!(buf.suffix_len() >= outer.footer_len());
+                    assert!(buf.len() <= outer.max_body_len());
+
+                    // It is `self.ser.serialize()`'s responsibility to ensure that there
+                    // is enough suffix room to fit any post-body padding and the footer,
+                    // but it is the caller's responsibility to actually add that padding
+                    // (ie, move it from the suffix to the body).
+                    let padding = outer.min_body_len().saturating_sub(buf.len());
+                    assert!(padding + outer.footer_len() <= buf.suffix_len());
+
                     assert!(!should_exceed_size_limit);
                     Ok(buf)
                 }
@@ -2025,7 +1916,7 @@ mod tests {
             self,
             limit: usize,
             truncating: bool,
-        ) -> VerifyingSerializer<Nested<Self, LimitedSizePacketBuilder<()>>>
+        ) -> VerifyingSerializer<Nested<Self, LimitedSizePacketBuilder>>
         where
             Self::Buffer: ReusableBuffer,
         {
@@ -2080,6 +1971,8 @@ mod tests {
     fn test_packet_constraints() {
         use PacketConstraints as PC;
 
+        // Test try_new
+
         // Sanity check.
         assert!(PC::try_new(0, 0, 0, 0).is_some());
         // header_len + min_body_len + footer_len doesn't overflow usize
@@ -2088,55 +1981,43 @@ mod tests {
         assert_eq!(PC::try_new(usize::MAX, 1, 0, 0), None);
         // min_body_len > max_body_len
         assert_eq!(PC::try_new(0, 0, 1, 0), None);
-    }
 
-    #[test]
-    fn test_nested_packet_builder() {
-        // DummyPacketBuilder itself doesn't have any interesting logic - it
-        // just calls out to PacketConstraints::new. We've already tested that
-        // method in test_packet_constraints. This test instead exercises the
-        // logic in Nested to make sure that PacketBuilders compose correctly.
-        //
-        // Each failure test case corresponds to one check in either
-        // Nested::constraints or PacketConstraints::new (which is called from
-        // Nested::constraints). Each test case is labeled "Test case N", and a
-        // corresponding comment in either of those two functions identifies
-        // which line is being tested.
-
-        use DummyPacketBuilder as DPB;
-        use PacketConstraints as PC;
+        // Test PacketConstraints::try_encapsulate
 
         // Sanity check.
-        let pb = DPB::new(10, 10, 0, usize::MAX);
-        assert_eq!(
-            pb.encapsulate(pb).try_constraints().unwrap(),
-            PC::new(20, 20, 0, usize::MAX - 20),
-        );
+        let pc = PC::new(10, 10, 0, usize::MAX);
+        assert_eq!(pc.try_encapsulate(&pc).unwrap(), PC::new(20, 20, 0, usize::MAX - 20));
 
-        // The outer PacketBuilder's minimum body length requirement of 10 is
-        // more than satisfied by the inner PacketBuilder's combined 20 bytes of
-        // header and footer. The resulting PacketBuilder has its minimum body
-        // length requirement saturated to 0.
-        let inner = DPB::new(10, 10, 0, usize::MAX);
-        let outer = DPB::new(0, 0, 10, usize::MAX);
-        assert_eq!(
-            inner.encapsulate(outer).try_constraints().unwrap(),
-            PC::new(10, 10, 0, usize::MAX - 20),
-        );
+        let pc = PC::new(10, 10, 0, usize::MAX);
+        assert_eq!(pc.try_encapsulate(&pc).unwrap(), PC::new(20, 20, 0, usize::MAX - 20));
+
+        // Starting here, each failure test case corresponds to one check in
+        // either PacketConstraints::try_encapsulate or PacketConstraints::new
+        // (which is called from PacketConstraints::try_encapsulate). Each test
+        // case is labeled "Test case N", and a corresponding comment in either
+        // of those two functions identifies which line is being tested.
+
+        // The outer PC's minimum body length requirement of 10 is more than
+        // satisfied by the inner PC's combined 20 bytes of header and footer.
+        // The resulting PC has its minimum body length requirement saturated to
+        // 0.
+        let inner = PC::new(10, 10, 0, usize::MAX);
+        let outer = PC::new(0, 0, 10, usize::MAX);
+        assert_eq!(inner.try_encapsulate(&outer).unwrap(), PC::new(10, 10, 0, usize::MAX - 20));
 
         // Test case 1
         //
         // The sum of the inner and outer header lengths overflows `usize`.
-        let inner = DPB::new(usize::MAX, 0, 0, usize::MAX);
-        let outer = DPB::new(1, 0, 0, usize::MAX);
-        assert_eq!(inner.encapsulate(outer).try_constraints(), None);
+        let inner = PC::new(usize::MAX, 0, 0, usize::MAX);
+        let outer = PC::new(1, 0, 0, usize::MAX);
+        assert_eq!(inner.try_encapsulate(&outer), None);
 
         // Test case 2
         //
         // The sum of the inner and outer footer lengths overflows `usize`.
-        let inner = DPB::new(0, usize::MAX, 0, usize::MAX);
-        let outer = DPB::new(0, 1, 0, usize::MAX);
-        assert_eq!(inner.encapsulate(outer).try_constraints(), None);
+        let inner = PC::new(0, usize::MAX, 0, usize::MAX);
+        let outer = PC::new(0, 1, 0, usize::MAX);
+        assert_eq!(inner.try_encapsulate(&outer), None);
 
         // Test case 3
         //
@@ -2145,26 +2026,26 @@ mod tests {
         // none of the intermediate additions overflow, so we make sure to test
         // that an overflow in the final addition will be caught.
         let one_fifth_max = (usize::MAX / 5) + 1;
-        let inner = DPB::new(one_fifth_max, one_fifth_max, one_fifth_max, usize::MAX);
-        let outer = DPB::new(one_fifth_max, one_fifth_max, 0, usize::MAX);
-        assert_eq!(inner.encapsulate(outer).try_constraints(), None);
+        let inner = PC::new(one_fifth_max, one_fifth_max, one_fifth_max, usize::MAX);
+        let outer = PC::new(one_fifth_max, one_fifth_max, 0, usize::MAX);
+        assert_eq!(inner.try_encapsulate(&outer), None);
 
         // Test case 4
         //
-        // The header and footer of the inner PacketBuilder exceed the maximum
-        // body length requirement of the outer PacketBuilder.
-        let inner = DPB::new(10, 10, 0, usize::MAX);
-        let outer = DPB::new(0, 0, 0, 10);
-        assert_eq!(inner.encapsulate(outer).try_constraints(), None);
+        // The header and footer of the inner PC exceed the maximum body length
+        // requirement of the outer PC.
+        let inner = PC::new(10, 10, 0, usize::MAX);
+        let outer = PC::new(0, 0, 0, 10);
+        assert_eq!(inner.try_encapsulate(&outer), None);
 
         // Test case 5
         //
         // The resulting minimum body length (thanks to the inner
         // PacketBuilder's minimum body length) is larger than the resulting
         // maximum body length.
-        let inner = DPB::new(0, 0, 10, usize::MAX);
-        let outer = DPB::new(0, 0, 0, 5);
-        assert_eq!(inner.encapsulate(outer).try_constraints(), None);
+        let inner = PC::new(0, 0, 10, usize::MAX);
+        let outer = PC::new(0, 0, 0, 5);
+        assert_eq!(inner.try_encapsulate(&outer), None);
     }
 
     #[test]
@@ -2188,7 +2069,8 @@ mod tests {
         let buf = INNER
             .into_serializer()
             .into_verifying(false)
-            .serialize_vec(DummyPacketBuilder::new(0, 0, 20, usize::MAX))
+            .encapsulate(DummyPacketBuilder::new(0, 0, 20, usize::MAX))
+            .serialize_vec_outer()
             .unwrap();
         assert_eq!(buf.as_ref(), concat(&[INNER, vec![0; 10].as_ref()]).as_slice());
 
@@ -2198,7 +2080,8 @@ mod tests {
         let buf = INNER
             .into_serializer()
             .into_verifying(false)
-            .serialize_vec(DummyPacketBuilder::new(10, 10, 0, usize::MAX))
+            .encapsulate(DummyPacketBuilder::new(10, 10, 0, usize::MAX))
+            .serialize_vec_outer()
             .unwrap();
         assert_eq!(
             buf.as_ref(),
@@ -2210,7 +2093,8 @@ mod tests {
             INNER
                 .into_serializer()
                 .into_verifying(false)
-                .serialize_vec(DummyPacketBuilder::new(0, 0, 0, 9))
+                .encapsulate(DummyPacketBuilder::new(0, 0, 0, 9))
+                .serialize_vec_outer()
                 .unwrap_err()
                 .0,
             SerializeError::SizeLimitExceeded
@@ -2241,12 +2125,13 @@ mod tests {
             let old_body = buffer.to_flattened_vec();
 
             let buffer = buffer
-                .serialize_vec(DummyPacketBuilder::new(
+                .encapsulate(DummyPacketBuilder::new(
                     header_len,
                     footer_len,
                     min_body_len,
                     usize::MAX,
                 ))
+                .serialize_vec_outer()
                 .unwrap();
             verify(buffer, &old_body, header_len, footer_len, min_body_len);
         }
@@ -2259,12 +2144,13 @@ mod tests {
         ) {
             let buffer = body
                 .into_serializer()
-                .serialize_vec(DummyPacketBuilder::new(
+                .encapsulate(DummyPacketBuilder::new(
                     header_len,
                     footer_len,
                     min_body_len,
                     usize::MAX,
                 ))
+                .serialize_vec_outer()
                 .unwrap();
             verify(buffer, body, header_len, footer_len, min_body_len);
         }
@@ -2382,6 +2268,8 @@ mod tests {
             .encapsulate_verifying(outer, false)
             .serialize_vec_outer()
             .unwrap();
+        assert_eq!(buf.prefix_len(), 0);
+        assert_eq!(buf.suffix_len(), 0);
         assert_eq!(
             buf.as_ref(),
             &[
@@ -2516,10 +2404,13 @@ mod tests {
             // should result in an allocation failure. Even if the body was
             // truncated, it should be returned to its original un-truncated
             // state before being returned from `serialize`.
-            let (e, new_ser) =
-                ser.clone().serialize_no_alloc(DummyPacketBuilder::new(2, 2, 0, 1)).unwrap_err();
+            let (e, new_ser) = ser
+                .clone()
+                .encapsulate(DummyPacketBuilder::new(2, 2, 0, 1))
+                .serialize_no_alloc_outer()
+                .unwrap_err();
             assert_eq!(err, e);
-            assert_eq!(new_ser, ser);
+            assert_eq!(new_ser.into_inner(), ser);
         }
 
         let body = Buf::new(vec![1, 2], ..);
@@ -2585,17 +2476,18 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_alloc_buffer_provider() {
-        // Test that the blanket impl of `BufferProvider` for `A: BufferAlloc`
-        // works as expected, returning Either::A when reusing is possible, and
-        // returning Either::B when realloc'ing is needed.
-
+    fn test_maybe_reuse_buffer_provider() {
         fn test_expect(body_range: Range<usize>, prefix: usize, suffix: usize, expect_a: bool) {
             let mut bytes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
             let buffer = Buf::new(&mut bytes[..], body_range);
             let body = buffer.as_ref().to_vec();
-            let buffer =
-                BufferProvider::reuse_or_realloc(new_buf_vec, buffer, prefix, suffix).unwrap();
+            let buffer = BufferProvider::reuse_or_realloc(
+                MaybeReuseBufferProvider(new_buf_vec),
+                buffer,
+                prefix,
+                suffix,
+            )
+            .unwrap();
             match &buffer {
                 Either::A(_) if expect_a => {}
                 Either::B(_) if !expect_a => {}
@@ -2629,6 +2521,37 @@ mod tests {
         // If we don't have enough capacity, it fails and must realloc.
         test_expect_realloc(0..9, 1, 1);
         test_expect_realloc(1..10, 1, 1);
+    }
+
+    #[test]
+    fn test_no_reuse_buffer_provider() {
+        #[track_caller]
+        fn test_expect(body_range: Range<usize>, prefix: usize, suffix: usize) {
+            let mut bytes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+            // The buffer that will not be reused.
+            let internal_buffer: Buf<&mut [u8]> = Buf::new(&mut bytes[..], body_range);
+            let body = internal_buffer.as_ref().to_vec();
+            // The newly allocated buffer, note the type is different from
+            // internal_buffer.
+            let buffer: Buf<Vec<u8>> = BufferProvider::reuse_or_realloc(
+                NoReuseBufferProvider(new_buf_vec),
+                internal_buffer,
+                prefix,
+                suffix,
+            )
+            .unwrap();
+            let bytes: &[u8] = buffer.as_ref();
+            assert_eq!(bytes, body.as_slice());
+            assert_eq!(buffer.prefix_len(), prefix);
+            assert_eq!(buffer.suffix_len(), suffix);
+        }
+        // No prefix or suffix trivially succeeds, reuse opportunity is ignored.
+        test_expect(0..10, 0, 0);
+        // If we have enough prefix/suffix, reuse opportunity is ignored.
+        test_expect(1..9, 1, 1);
+        // Prefix and suffix and properly allocated and the body is copied.
+        test_expect(0..9, 10, 10);
+        test_expect(1..10, 15, 15);
     }
 
     /// Simple Vec-backed buffer to test fragmented buffers implementation.
@@ -2692,6 +2615,16 @@ mod tests {
     }
 
     impl<B: BufferMut> GrowBuffer for ScatterGatherBuf<B> {
+        fn with_parts<O, F>(&self, f: F) -> O
+        where
+            F: for<'a, 'b> FnOnce(&'a [u8], FragmentedBytes<'a, 'b>, &'a [u8]) -> O,
+        {
+            let (prefix, rest) = self.data.split_at(self.range.start);
+            let (prefix_b, rest) = rest.split_at(self.mid - self.range.start);
+            let (suffix_b, suffix) = rest.split_at(self.range.end - self.mid);
+            let mut bytes = [prefix_b, self.inner.as_ref(), suffix_b];
+            f(prefix, bytes.as_fragmented_byte_slice(), suffix)
+        }
         fn prefix_len(&self) -> usize {
             self.range.start
         }
@@ -2710,8 +2643,8 @@ mod tests {
         }
     }
 
-    impl<B: BufferMut> TargetBuffer for ScatterGatherBuf<B> {
-        fn with_parts<O, F>(&mut self, f: F) -> O
+    impl<B: BufferMut> GrowBufferMut for ScatterGatherBuf<B> {
+        fn with_parts_mut<O, F>(&mut self, f: F) -> O
         where
             F: for<'a, 'b> FnOnce(&'a mut [u8], FragmentedBytesMut<'a, 'b>, &'a mut [u8]) -> O,
         {

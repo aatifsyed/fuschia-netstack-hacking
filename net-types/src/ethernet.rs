@@ -6,7 +6,7 @@
 
 use core::fmt::{self, Debug, Display, Formatter};
 
-use zerocopy::{AsBytes, FromBytes, Unaligned};
+use zerocopy::{AsBytes, FromBytes, FromZeros, NoCell, Unaligned};
 
 use crate::ip::{AddrSubnet, IpAddr, IpAddress, Ipv6, Ipv6Addr};
 use crate::{
@@ -39,7 +39,7 @@ use crate::{
 ///     ethertype: [u8; 2],
 /// }
 /// ```
-#[derive(Copy, Clone, Eq, PartialEq, Hash, FromBytes, AsBytes, Unaligned)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, FromZeros, FromBytes, AsBytes, NoCell, Unaligned)]
 #[repr(transparent)]
 pub struct Mac([u8; Mac::BYTES]);
 
@@ -64,6 +64,9 @@ impl Mac {
     /// [RFC 4291]: https://tools.ietf.org/html/rfc4291
     /// [`to_eui64`]: crate::ethernet::Mac::to_eui64
     pub const DEFAULT_EUI_MAGIC: [u8; 2] = [0xff, 0xfe];
+
+    /// The all-zeroes MAC address.
+    pub const UNSPECIFIED: Mac = Mac([0x00; Self::BYTES]);
 
     /// Constructs a new MAC address.
     #[inline]
@@ -297,7 +300,7 @@ impl Display for Mac {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{:X}:{:X}:{:X}:{:X}:{:X}:{:X}",
+            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
             self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5]
         )
     }
@@ -377,5 +380,10 @@ mod tests {
         let ipv6 = Ipv6Addr::new([0xff02, 0, 0, 0, 0, 0, 0x100, 3]);
         let mac = Mac::from(&MulticastAddr::new(ipv6).unwrap());
         assert_eq!(mac, Mac::new([0x33, 0x33, 1, 0, 0, 3]));
+    }
+
+    #[test]
+    fn mac_display_leading_zeroes() {
+        assert_eq!(Mac::new([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).to_string(), "00:00:00:00:00:00");
     }
 }

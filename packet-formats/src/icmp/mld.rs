@@ -21,7 +21,8 @@ use packet::{
     BufferView,
 };
 use zerocopy::{
-    byteorder::network_endian::U16, AsBytes, ByteSlice, FromBytes, LayoutVerified, Unaligned,
+    byteorder::network_endian::U16, AsBytes, ByteSlice, FromBytes, FromZeros, NoCell, Ref,
+    Unaligned,
 };
 
 use crate::error::{ParseError, ParseResult, UnrecognizedProtocolCode};
@@ -57,7 +58,7 @@ create_protocol_enum!(
 /// [RFC 3810 section 5.2].
 ///
 /// [RFC 3810 section 5.2]: https://www.rfc-editor.org/rfc/rfc3810#section-5.2
-#[derive(Copy, Clone, Debug, AsBytes, FromBytes, Unaligned)]
+#[derive(Copy, Clone, Debug, AsBytes, FromZeros, FromBytes, NoCell, Unaligned)]
 #[repr(C)]
 pub struct MulticastRecordHeader {
     record_type: u8,
@@ -88,8 +89,8 @@ impl MulticastRecordHeader {
 ///
 /// [RFC 3810 section 5.2]: https://www.rfc-editor.org/rfc/rfc3810#section-5.2
 pub struct MulticastRecord<B> {
-    header: LayoutVerified<B, MulticastRecordHeader>,
-    sources: LayoutVerified<B, [Ipv6Addr]>,
+    header: Ref<B, MulticastRecordHeader>,
+    sources: Ref<B, [Ipv6Addr]>,
 }
 
 impl<B: ByteSlice> MulticastRecord<B> {
@@ -140,7 +141,7 @@ impl<'a> RecordsImpl<'a> for Mldv2ReportRecords {
 ///
 /// [RFC 3810 section 5.2]: https://www.rfc-editor.org/rfc/rfc3810#section-5.2
 #[repr(C)]
-#[derive(AsBytes, FromBytes, Unaligned, Copy, Clone, Debug)]
+#[derive(AsBytes, FromZeros, FromBytes, NoCell, Unaligned, Copy, Clone, Debug)]
 pub struct Mldv2ReportMessageHeader {
     /// Initialized to zero by the sender; ignored by receivers.
     _reserved: [u8; 2],
@@ -161,7 +162,7 @@ impl Mldv2ReportMessageHeader {
 /// [RFC 3810 section 5.2]: https://www.rfc-editor.org/rfc/rfc3810#section-5.2
 #[derive(Debug)]
 pub struct Mldv2ReportBody<B: ByteSlice> {
-    header: LayoutVerified<B, Mldv2ReportMessageHeader>,
+    header: Ref<B, Mldv2ReportMessageHeader>,
     records: Records<B, Mldv2ReportRecords>,
 }
 
@@ -177,10 +178,11 @@ impl<B: ByteSlice> Mldv2ReportBody<B> {
     }
 }
 
-impl<B: ByteSlice> MessageBody<B> for Mldv2ReportBody<B> {
+impl<B: ByteSlice> MessageBody for Mldv2ReportBody<B> {
+    type B = B;
     fn parse(bytes: B) -> ParseResult<Self> {
-        let (header, bytes) = LayoutVerified::<_, Mldv2ReportMessageHeader>::new_from_prefix(bytes)
-            .ok_or(ParseError::Format)?;
+        let (header, bytes) =
+            Ref::<_, Mldv2ReportMessageHeader>::new_from_prefix(bytes).ok_or(ParseError::Format)?;
         let records = Records::parse_with_context(bytes, header.num_mcast_addr_records().into())?;
         Ok(Mldv2ReportBody { header, records })
     }
@@ -196,7 +198,7 @@ impl<B: ByteSlice> MessageBody<B> for Mldv2ReportBody<B> {
 
 /// Multicast Listener Report V2 Message.
 #[repr(C)]
-#[derive(AsBytes, FromBytes, Unaligned, Copy, Clone, Debug)]
+#[derive(AsBytes, FromZeros, FromBytes, NoCell, Unaligned, Copy, Clone, Debug)]
 pub struct MulticastListenerReportV2;
 
 impl_icmp_message!(
@@ -209,17 +211,17 @@ impl_icmp_message!(
 
 /// Multicast Listener Query V1 Message.
 #[repr(C)]
-#[derive(AsBytes, FromBytes, Unaligned, Copy, Clone, Debug)]
+#[derive(AsBytes, FromZeros, FromBytes, NoCell, Unaligned, Copy, Clone, Debug)]
 pub struct MulticastListenerQuery;
 
 /// Multicast Listener Report V1 Message.
 #[repr(C)]
-#[derive(AsBytes, FromBytes, Unaligned, Copy, Clone, Debug)]
+#[derive(AsBytes, FromZeros, FromBytes, NoCell, Unaligned, Copy, Clone, Debug)]
 pub struct MulticastListenerReport;
 
 /// Multicast Listener Done V1 Message.
 #[repr(C)]
-#[derive(AsBytes, FromBytes, Unaligned, Copy, Clone, Debug)]
+#[derive(AsBytes, FromZeros, FromBytes, NoCell, Unaligned, Copy, Clone, Debug)]
 pub struct MulticastListenerDone;
 
 /// MLD Errors.
@@ -246,8 +248,8 @@ pub trait Mldv1MessageType {
 }
 
 /// The trait for all ICMPv6 messages holding MLDv1 messages.
-pub trait IcmpMldv1MessageType<B: ByteSlice>:
-    Mldv1MessageType + IcmpMessage<Ipv6, B, Code = IcmpUnusedCode>
+pub trait IcmpMldv1MessageType:
+    Mldv1MessageType + IcmpMessage<Ipv6, Code = IcmpUnusedCode>
 {
 }
 
@@ -303,7 +305,7 @@ impl TryFrom<Duration> for Mldv1ResponseDelay {
 
 /// The layout for an MLDv1 message body.
 #[repr(C)]
-#[derive(AsBytes, FromBytes, Unaligned, Copy, Clone, Debug)]
+#[derive(AsBytes, FromZeros, FromBytes, NoCell, Unaligned, Copy, Clone, Debug)]
 pub struct Mldv1Message {
     /// Max Response Delay, in units of milliseconds.
     pub max_response_delay: U16,
@@ -328,7 +330,7 @@ impl Mldv1Message {
 
 /// The on-wire structure for the body of an MLDv1 message.
 #[derive(Debug)]
-pub struct Mldv1Body<B: ByteSlice>(LayoutVerified<B, Mldv1Message>);
+pub struct Mldv1Body<B: ByteSlice>(Ref<B, Mldv1Message>);
 
 impl<B: ByteSlice> Deref for Mldv1Body<B> {
     type Target = Mldv1Message;
@@ -338,9 +340,10 @@ impl<B: ByteSlice> Deref for Mldv1Body<B> {
     }
 }
 
-impl<B: ByteSlice> MessageBody<B> for Mldv1Body<B> {
+impl<B: ByteSlice> MessageBody for Mldv1Body<B> {
+    type B = B;
     fn parse(bytes: B) -> ParseResult<Self> {
-        LayoutVerified::new(bytes).map_or(Err(ParseError::Format), |body| Ok(Mldv1Body(body)))
+        Ref::new(bytes).map_or(Err(ParseError::Format), |body| Ok(Mldv1Body(body)))
     }
 
     fn len(&self) -> usize {
@@ -359,7 +362,7 @@ macro_rules! impl_mldv1_message {
             type MaxRespDelay = $resp_code;
             type GroupAddr = $group_addr;
         }
-        impl<B: ByteSlice> IcmpMldv1MessageType<B> for $msg {}
+        impl IcmpMldv1MessageType for $msg {}
     };
 }
 
@@ -430,10 +433,7 @@ mod tests {
     };
     use crate::ipv6::{Ipv6Header, Ipv6Packet, Ipv6PacketBuilder, Ipv6PacketBuilderWithHbhOptions};
 
-    fn serialize_to_bytes<
-        B: ByteSlice + Debug,
-        M: IcmpMessage<Ipv6, B> + Mldv1MessageType + Debug,
-    >(
+    fn serialize_to_bytes<B: ByteSlice + Debug, M: IcmpMessage<Ipv6> + Mldv1MessageType + Debug>(
         src_ip: Ipv6Addr,
         dst_ip: Ipv6Addr,
         icmp: &IcmpPacket<Ipv6, B, M>,
@@ -460,7 +460,7 @@ mod tests {
     }
 
     fn test_parse_and_serialize<
-        M: for<'a> IcmpMessage<Ipv6, &'a [u8]> + Mldv1MessageType + Debug,
+        M: IcmpMessage<Ipv6> + Mldv1MessageType + Debug,
         F: FnOnce(&Ipv6Packet<&[u8]>),
         G: for<'a> FnOnce(&IcmpPacket<Ipv6, &'a [u8], M>),
     >(
@@ -482,7 +482,7 @@ mod tests {
         assert_eq!(&data[..], orig_req);
     }
 
-    fn serialize_to_bytes_with_builder<B: ByteSlice + Debug, M: IcmpMldv1MessageType<B> + Debug>(
+    fn serialize_to_bytes_with_builder<M: IcmpMldv1MessageType + Debug>(
         src_ip: Ipv6Addr,
         dst_ip: Ipv6Addr,
         msg: M,
@@ -533,7 +533,7 @@ mod tests {
 
     fn check_icmp<
         B: ByteSlice,
-        M: IcmpMessage<Ipv6, B, Body = Mldv1Body<B>> + Mldv1MessageType + Debug,
+        M: IcmpMessage<Ipv6, Body<B> = Mldv1Body<B>> + Mldv1MessageType + Debug,
     >(
         icmp: &IcmpPacket<Ipv6, B, M>,
         max_resp_code: u16,
@@ -599,7 +599,7 @@ mod tests {
     fn test_mld_serialize_and_parse_query() {
         use crate::icmp::mld::MulticastListenerQuery;
         use crate::testdata::mld_router_query::*;
-        let bytes = serialize_to_bytes_with_builder::<&[u8], _>(
+        let bytes = serialize_to_bytes_with_builder::<_>(
             SRC_IP,
             DST_IP,
             MulticastListenerQuery,
@@ -622,7 +622,7 @@ mod tests {
     fn test_mld_serialize_and_parse_report() {
         use crate::icmp::mld::MulticastListenerReport;
         use crate::testdata::mld_router_report::*;
-        let bytes = serialize_to_bytes_with_builder::<&[u8], _>(
+        let bytes = serialize_to_bytes_with_builder::<_>(
             SRC_IP,
             DST_IP,
             MulticastListenerReport,
@@ -645,7 +645,7 @@ mod tests {
     fn test_mld_serialize_and_parse_done() {
         use crate::icmp::mld::MulticastListenerDone;
         use crate::testdata::mld_router_done::*;
-        let bytes = serialize_to_bytes_with_builder::<&[u8], _>(
+        let bytes = serialize_to_bytes_with_builder::<_>(
             SRC_IP,
             DST_IP,
             MulticastListenerDone,

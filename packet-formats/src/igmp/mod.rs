@@ -29,10 +29,10 @@ use core::mem;
 use internet_checksum::Checksum;
 use net_types::ip::Ipv4Addr;
 use packet::{
-    AsFragmentedByteSlice, BufferView, FragmentedByteSlice, InnerPacketBuilder, PacketBuilder,
-    PacketConstraints, ParsablePacket, ParseMetadata, SerializeBuffer,
+    AsFragmentedByteSlice, BufferView, FragmentedByteSlice, FragmentedBytesMut, InnerPacketBuilder,
+    PacketBuilder, PacketConstraints, ParsablePacket, ParseMetadata, SerializeTarget,
 };
-use zerocopy::{AsBytes, ByteSlice, FromBytes, LayoutVerified, Unaligned};
+use zerocopy::{AsBytes, ByteSlice, FromBytes, FromZeros, NoCell, Ref, Unaligned};
 
 use self::messages::IgmpMessageType;
 use crate::error::ParseError;
@@ -52,7 +52,7 @@ pub trait MessageType<B> {
     ///
     /// These are the bytes immediately following the checksum bytes in an IGMP
     /// message. Most IGMP messages' `FixedHeader` is an IPv4 address.
-    type FixedHeader: Sized + Copy + Clone + FromBytes + AsBytes + Unaligned + Debug;
+    type FixedHeader: Sized + Copy + Clone + FromBytes + AsBytes + NoCell + Unaligned + Debug;
 
     /// The variable-length body for the message type.
     type VariableBody: Sized;
@@ -93,7 +93,7 @@ pub trait MessageType<B> {
     // `VariableBody` as `[u8]` to `MessageType` as opposed to just enforcing
     // a trait in `VariableBody` to do so. The decision to go this way is to
     // be able to relax the `ByteSlice` requirement on `B` elsewhere and it
-    // also plays better with existing traits on `LayoutVerified` and
+    // also plays better with existing traits on `Ref` and
     // `Records`.
     fn body_bytes(body: &Self::VariableBody) -> &[u8]
     where
@@ -158,7 +158,7 @@ impl<B, M: MessageType<B>> IgmpPacketBuilder<B, M> {
     fn serialize_headers<BB: packet::Fragment>(
         &self,
         mut headers_buff: &mut [u8],
-        body: &FragmentedByteSlice<'_, BB>,
+        body: FragmentedByteSlice<'_, BB>,
     ) {
         use packet::BufferViewMut;
         let mut bytes = &mut headers_buff;
@@ -173,7 +173,7 @@ impl<B, M: MessageType<B>> IgmpPacketBuilder<B, M> {
             bytes.take_obj_front_zero::<M::FixedHeader>().expect("too few bytes for IGMP message");
         *header = self.message_header;
 
-        let checksum = compute_checksum_fragmented(&header_prefix, &header.bytes(), body);
+        let checksum = compute_checksum_fragmented(&header_prefix, &header.bytes(), &body);
         header_prefix.checksum = checksum;
     }
 }
@@ -187,7 +187,7 @@ impl<B, M: MessageType<B, VariableBody = ()>> InnerPacketBuilder for IgmpPacketB
 
     fn serialize(&self, buffer: &mut [u8]) {
         let empty = FragmentedByteSlice::<&'static [u8]>::new_empty();
-        self.serialize_headers(buffer, &empty);
+        self.serialize_headers(buffer, empty);
     }
 }
 
@@ -204,10 +204,12 @@ where
         )
     }
 
-    fn serialize(&self, buffer: &mut SerializeBuffer<'_, '_>) {
-        let (prefix, message_body, _) = buffer.parts();
-        // implements BufferViewMut, giving us take_obj_xxx_zero methods
-        self.serialize_headers(prefix, message_body);
+    fn serialize(
+        &self,
+        target: &mut SerializeTarget<'_>,
+        message_body: FragmentedBytesMut<'_, '_>,
+    ) {
+        self.serialize_headers(target.header, message_body);
     }
 }
 
@@ -218,7 +220,7 @@ where
 ///
 /// Note that even though `max_rsp_time` is part of `HeaderPrefix`, it is not
 /// meaningful or used in every message.
-#[derive(Default, Debug, AsBytes, FromBytes, Unaligned)]
+#[derive(Default, Debug, AsBytes, FromZeros, FromBytes, NoCell, Unaligned)]
 #[repr(C)]
 pub struct HeaderPrefix {
     msg_type: u8,
@@ -245,8 +247,8 @@ impl HeaderPrefix {
 /// `MessageType` trait.
 #[derive(Debug)]
 pub struct IgmpMessage<B: ByteSlice, M: MessageType<B>> {
-    prefix: LayoutVerified<B, HeaderPrefix>,
-    header: LayoutVerified<B, M::FixedHeader>,
+    prefix: Ref<B, HeaderPrefix>,
+    header: Ref<B, M::FixedHeader>,
     body: M::VariableBody,
 }
 
@@ -356,7 +358,7 @@ pub fn peek_message_type<MessageType: TryFrom<u8>>(
     // a single Ipv4Address
     let long_message =
         bytes.len() > (core::mem::size_of::<HeaderPrefix>() + core::mem::size_of::<Ipv4Addr>());
-    let (header, _) = LayoutVerified::<_, HeaderPrefix>::new_unaligned_from_prefix(bytes)
+    let (header, _) = Ref::<_, HeaderPrefix>::new_unaligned_from_prefix(bytes)
         .ok_or_else(debug_err_fn!(ParseError::Format, "too few bytes for header"))?;
     let msg_type = MessageType::try_from(header.msg_type).map_err(|_| {
         debug_err!(ParseError::NotSupported, "unrecognized message type: {:x}", header.msg_type,)

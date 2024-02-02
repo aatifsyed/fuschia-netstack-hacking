@@ -18,7 +18,10 @@
 // TODO(joshlf): Move into debug_err! and debug_err_fn! definitions once
 // attributes are allowed on expressions
 // (https://github.com/rust-lang/rust/issues/15701).
+// FIXME(http://b/318154202): We can remove after we've rolled the rust compiler.
+#![allow(unknown_lints, renamed_and_removed_lints)]
 #![allow(clippy::blocks_in_if_conditions)]
+#![allow(clippy::blocks_in_conditions)]
 #![deny(missing_docs, unreachable_patterns)]
 
 extern crate alloc;
@@ -36,7 +39,7 @@ macro_rules! debug_err {
         // TODO(joshlf): Uncomment once attributes are allowed on expressions
         // #[cfg_attr(feature = "cargo-clippy", allow(block_in_if_condition_stmt))]
         {
-            use ::log::debug;
+            use ::tracing::debug;
             debug!($($arg)*);
             $err
         }
@@ -52,7 +55,7 @@ macro_rules! debug_err_fn {
         // TODO(joshlf): Uncomment once attributes are allowed on expressions
         // #[cfg_attr(feature = "cargo-clippy", allow(block_in_if_condition_stmt))]
         || {
-            use ::log::debug;
+            use ::tracing::debug;
             debug!($($arg)*);
             $err
         }
@@ -80,7 +83,7 @@ use core::num::TryFromIntError;
 
 use internet_checksum::Checksum;
 use net_types::ip::{Ip, IpAddress, IpInvariant as IpInv, Ipv6Addr};
-use packet::SerializeBuffer;
+use packet::{FragmentedBytesMut, SerializeTarget};
 use zerocopy::byteorder::{ByteOrder, NetworkEndian};
 
 // The "sealed trait" pattern.
@@ -183,17 +186,18 @@ where
 /// Compute the checksum used by TCP and UDP.
 ///
 /// Same as [`compute_transport_checksum_parts`] but gets the parts from a
-/// `SerializeBuffer`.
+/// `SerializeTarget`.
 fn compute_transport_checksum_serialize<A: IpAddress>(
     src_ip: A,
     dst_ip: A,
     proto: u8,
-    buffer: &mut SerializeBuffer<'_, '_>,
+    target: &mut SerializeTarget<'_>,
+    body: FragmentedBytesMut<'_, '_>,
 ) -> Option<[u8; 2]> {
     // See for details:
     // https://en.wikipedia.org/wiki/Transmission_Control_Protocol#Checksum_computation
     let mut checksum = Checksum::new();
-    let transport_len = buffer.len();
+    let transport_len = target.header.len() + body.len() + target.footer.len();
     update_transport_checksum_pseudo_header::<A::Version>(
         &mut checksum,
         src_ip,
@@ -203,11 +207,11 @@ fn compute_transport_checksum_serialize<A: IpAddress>(
     )
     .ok()?;
 
-    checksum.add_bytes(buffer.header());
-    for p in buffer.body().iter_fragments() {
+    checksum.add_bytes(target.header);
+    for p in body.iter_fragments() {
         checksum.add_bytes(p);
     }
-    checksum.add_bytes(buffer.footer());
+    checksum.add_bytes(target.footer);
     Some(checksum.checksum())
 }
 

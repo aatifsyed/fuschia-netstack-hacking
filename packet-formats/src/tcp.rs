@@ -21,13 +21,13 @@ use explicit::ResultExt as _;
 use net_types::ip::IpAddress;
 use packet::records::options::OptionsRaw;
 use packet::{
-    BufferView, BufferViewMut, ByteSliceInnerPacketBuilder, EmptyBuf, FragmentedByteSlice, FromRaw,
+    BufferView, BufferViewMut, ByteSliceInnerPacketBuilder, EmptyBuf, FragmentedBytesMut, FromRaw,
     InnerPacketBuilder, MaybeParsed, PacketBuilder, PacketConstraints, ParsablePacket,
-    ParseMetadata, SerializeBuffer, Serializer,
+    ParseMetadata, SerializeTarget, Serializer,
 };
 use zerocopy::{
     byteorder::network_endian::{U16, U32},
-    AsBytes, ByteSlice, FromBytes, LayoutVerified, Unaligned,
+    AsBytes, ByteSlice, FromBytes, FromZeros, NoCell, Ref, Unaligned,
 };
 
 use crate::error::{ParseError, ParseResult};
@@ -49,7 +49,7 @@ pub const MAX_OPTIONS_LEN: usize = MAX_HDR_LEN - HDR_PREFIX_LEN;
 const CHECKSUM_OFFSET: usize = 16;
 const CHECKSUM_RANGE: Range<usize> = CHECKSUM_OFFSET..CHECKSUM_OFFSET + 2;
 
-#[derive(Debug, Default, FromBytes, AsBytes, Unaligned, PartialEq)]
+#[derive(Debug, Default, FromZeros, FromBytes, AsBytes, NoCell, Unaligned, PartialEq)]
 #[repr(C)]
 struct HeaderPrefix {
     src_port: U16,
@@ -113,7 +113,9 @@ mod data_offset_reserved_flags {
     /// into new segments - in these cases, if we were to unconditionally set
     /// the reserved bits to zero, we could be changing the semantics of a TCP
     /// segment.
-    #[derive(FromBytes, AsBytes, Unaligned, Copy, Clone, Debug, Default, Eq, PartialEq)]
+    #[derive(
+        FromZeros, FromBytes, AsBytes, NoCell, Unaligned, Copy, Clone, Debug, Default, Eq, PartialEq,
+    )]
     #[repr(transparent)]
     pub(super) struct DataOffsetReservedFlags(U16);
 
@@ -208,7 +210,7 @@ mod data_offset_reserved_flags {
 /// `TcpSegmentBuilder` - maintains the invariant that the checksum is always
 /// valid.
 pub struct TcpSegment<B> {
-    hdr_prefix: LayoutVerified<B, HeaderPrefix>,
+    hdr_prefix: Ref<B, HeaderPrefix>,
     // Invariant: At most MAX_OPTIONS_LEN bytes long. This guarantees that we
     // can store these in an `ArrayVec<u8, MAX_OPTIONS_LEN>` in `builder`.
     options: Options<B>,
@@ -446,17 +448,60 @@ impl<B: ByteSlice> TcpSegment<B> {
 ///
 /// A `TcpFlowHeader` may be the result of a partially parsed TCP segment in
 /// [`TcpSegmentRaw`].
-#[derive(Debug, Default, FromBytes, AsBytes, Unaligned, PartialEq)]
+#[derive(
+    Debug, Default, FromZeros, FromBytes, AsBytes, NoCell, Unaligned, PartialEq, Copy, Clone,
+)]
 #[repr(C)]
-struct TcpFlowHeader {
+pub struct TcpFlowHeader {
+    /// Source port.
     src_port: U16,
+    /// Destination port.
     dst_port: U16,
+}
+
+impl TcpFlowHeader {
+    /// Gets the (src, dst) port tuple.
+    pub fn src_dst(&self) -> (u16, u16) {
+        (self.src_port.get(), self.dst_port.get())
+    }
 }
 
 #[derive(Debug)]
 struct PartialHeaderPrefix<B: ByteSlice> {
-    flow: LayoutVerified<B, TcpFlowHeader>,
+    flow: Ref<B, TcpFlowHeader>,
     rest: B,
+}
+
+/// Contains the TCP flow info and its sequence number.
+///
+/// This is useful for TCP endpoints processing ingress ICMP messages so that it
+/// can deliver the ICMP message to the right socket and also perform checks
+/// against the sequence number to make sure it corresponds to an in-flight
+/// segment.
+#[derive(Debug, Default, FromZeros, FromBytes, AsBytes, NoCell, Unaligned, PartialEq)]
+#[repr(C)]
+pub struct TcpFlowAndSeqNum {
+    /// The flow header.
+    flow: TcpFlowHeader,
+    /// The sequence number.
+    seqnum: U32,
+}
+
+impl TcpFlowAndSeqNum {
+    /// Gets the source port.
+    pub fn src_port(&self) -> u16 {
+        self.flow.src_port.get()
+    }
+
+    /// Gets the destination port.
+    pub fn dst_port(&self) -> u16 {
+        self.flow.dst_port.get()
+    }
+
+    /// Gets the sequence number.
+    pub fn sequence_num(&self) -> u32 {
+        self.seqnum.get()
+    }
 }
 
 /// A partially-parsed and not yet validated TCP segment.
@@ -473,7 +518,7 @@ struct PartialHeaderPrefix<B: ByteSlice> {
 /// [`TcpSegment`] provides a [`FromRaw`] implementation that can be used to
 /// validate a `TcpSegmentRaw`.
 pub struct TcpSegmentRaw<B: ByteSlice> {
-    hdr_prefix: MaybeParsed<LayoutVerified<B, HeaderPrefix>, PartialHeaderPrefix<B>>,
+    hdr_prefix: MaybeParsed<Ref<B, HeaderPrefix>, PartialHeaderPrefix<B>>,
     // Invariant: At most MAX_OPTIONS_LEN bytes long. This guarantees that we
     // can store these in an `ArrayVec<u8, MAX_OPTIONS_LEN>` in `builder`.
     options: MaybeParsed<OptionsRaw<B, TcpOptionsImpl>, B>,
@@ -536,6 +581,17 @@ where
 }
 
 impl<B: ByteSlice> TcpSegmentRaw<B> {
+    /// Gets the flow header from this packet.
+    pub fn flow_header(&self) -> TcpFlowHeader {
+        match &self.hdr_prefix {
+            MaybeParsed::Complete(c) => {
+                let HeaderPrefix { src_port, dst_port, .. } = &**c;
+                TcpFlowHeader { src_port: *src_port, dst_port: *dst_port }
+            }
+            MaybeParsed::Incomplete(i) => *i.flow,
+        }
+    }
+
     /// Constructs a builder with the same contents as this packet.
     ///
     /// Returns `None` if an entire TCP header was not successfully parsed.
@@ -693,16 +749,17 @@ impl<A: IpAddress, O: InnerPacketBuilder> PacketBuilder for TcpSegmentBuilderWit
         PacketConstraints::new(header_len, 0, 0, (1 << 16) - 1 - header_len)
     }
 
-    fn serialize(&self, buffer: &mut SerializeBuffer<'_, '_>) {
-        let (mut header, _body, _footer): (_, &mut FragmentedByteSlice<'_, _>, &mut [u8]) =
-            buffer.parts();
-        // `&mut header` has type `&mut &mut [u8]`, which implements
-        // `BufferViewMut`, giving us the `take_back_zero` method.
-        let mut header = &mut header;
+    fn serialize(&self, target: &mut SerializeTarget<'_>, body: FragmentedBytesMut<'_, '_>) {
         let opt_len = self.aligned_options_len();
+        // `take_back_zero` consumes the extent of the receiving slice, but that
+        // behavior is undesirable here: `prefix_builder.serialize` also needs
+        // to write into the header. To avoid changing the extent of
+        // target.header, we re-slice header before calling `take_back_zero`;
+        // the re-slice will be consumed, but `target.header` is unaffected.
+        let mut header = &mut &mut target.header[..];
         let options = header.take_back_zero(opt_len).expect("too few bytes for TCP options");
         self.options.serialize(options);
-        self.prefix_builder.serialize(buffer);
+        self.prefix_builder.serialize(target, body);
     }
 }
 
@@ -779,18 +836,21 @@ impl<A: IpAddress> PacketBuilder for TcpSegmentBuilder<A> {
         PacketConstraints::new(HDR_PREFIX_LEN, 0, 0, core::usize::MAX)
     }
 
-    fn serialize(&self, buffer: &mut SerializeBuffer<'_, '_>) {
-        let mut header = buffer.header();
-        let hdr_len = header.len();
-        // Implements BufferViewMut, giving us write_obj_front method.
-        let mut header = &mut header;
+    fn serialize(&self, target: &mut SerializeTarget<'_>, body: FragmentedBytesMut<'_, '_>) {
+        let hdr_len = target.header.len();
+        let total_len = hdr_len + body.len() + target.footer.len();
 
         debug_assert_eq!(hdr_len % 4, 0, "header length isn't a multiple of 4: {}", hdr_len);
         let mut data_offset_reserved_flags = self.data_offset_reserved_flags;
         data_offset_reserved_flags.set_data_offset(
             (hdr_len / 4).try_into().expect("header length too long for TCP segment"),
         );
-        header
+        // `write_obj_front` consumes the extent of the receiving slice, but
+        // that behavior is undesirable here: at the end of this method, we
+        // write the checksum back into the header. To avoid this, we re-slice
+        // header before calling `write_obj_front`; the re-slice will be
+        // consumed, but `target.header` is unaffected.
+        (&mut &mut target.header[..])
             .write_obj_front(&HeaderPrefix::new(
                 self.src_port.map_or(0, NonZeroU16::get),
                 self.dst_port.map_or(0, NonZeroU16::get),
@@ -811,15 +871,16 @@ impl<A: IpAddress> PacketBuilder for TcpSegmentBuilder<A> {
             self.src_ip,
             self.dst_ip,
             IpProto::Tcp.into(),
-            buffer,
+            target,
+            body,
         )
         .unwrap_or_else(|| {
             panic!(
                 "total TCP segment length of {} bytes overflows length field of pseudo-header",
-                buffer.len()
+                total_len
             )
         });
-        buffer.header()[CHECKSUM_RANGE].copy_from_slice(&checksum[..]);
+        target.header[CHECKSUM_RANGE].copy_from_slice(&checksum[..]);
     }
 }
 
@@ -830,7 +891,7 @@ pub mod options {
     };
     use packet::BufferViewMut as _;
     use zerocopy::byteorder::{network_endian::U32, ByteOrder, NetworkEndian};
-    use zerocopy::{AsBytes, FromBytes, LayoutVerified, Unaligned};
+    use zerocopy::{AsBytes, FromBytes, FromZeros, NoCell, Ref, Unaligned};
 
     use super::*;
 
@@ -877,7 +938,9 @@ pub mod options {
     /// See [RFC 2018] for more details.
     ///
     /// [RFC 2018]: https://tools.ietf.org/html/rfc2018
-    #[derive(Copy, Clone, Eq, PartialEq, Debug, FromBytes, AsBytes, Unaligned)]
+    #[derive(
+        Copy, Clone, Eq, PartialEq, Debug, FromZeros, FromBytes, AsBytes, NoCell, Unaligned,
+    )]
     #[repr(C)]
     pub struct TcpSackBlock {
         left_edge: U32,
@@ -945,7 +1008,7 @@ pub mod options {
                     }
                 }
                 self::OPTION_KIND_SACK => Ok(Some(TcpOption::Sack(
-                    LayoutVerified::new_slice(data).ok_or(OptionParseErr)?.into_slice(),
+                    Ref::new_slice(data).ok_or(OptionParseErr)?.into_slice(),
                 ))),
                 self::OPTION_KIND_TIMESTAMP => {
                     if data.len() != 8 {
@@ -1165,12 +1228,7 @@ mod tests {
     }
 
     fn hdr_prefix_to_bytes(hdr_prefix: HeaderPrefix) -> [u8; HDR_PREFIX_LEN] {
-        let mut bytes = [0; HDR_PREFIX_LEN];
-        {
-            let mut lv = LayoutVerified::<_, HeaderPrefix>::new_unaligned(&mut bytes[..]).unwrap();
-            *lv = hdr_prefix;
-        }
-        bytes
+        zerocopy::transmute!(hdr_prefix)
     }
 
     // Return a new HeaderPrefix with reasonable defaults, including a valid
@@ -1314,8 +1372,7 @@ mod tests {
             .unwrap_b();
 
         // Set all three reserved bits and update the checksum.
-        let mut hdr_prefix =
-            LayoutVerified::<_, HeaderPrefix>::new_unaligned(buffer.as_mut()).unwrap();
+        let mut hdr_prefix = Ref::<_, HeaderPrefix>::new_unaligned(buffer.as_mut()).unwrap();
         let old_checksum = hdr_prefix.checksum;
         let old_data_offset_reserved_flags = hdr_prefix.data_offset_reserved_flags;
         hdr_prefix.data_offset_reserved_flags.as_bytes_mut()[0] |= 0b00000111;
@@ -1449,7 +1506,12 @@ mod tests {
 
     fn bench_parse_inner<B: Bencher>(b: &mut B) {
         use crate::testdata::tls_client_hello_v4::*;
-        let bytes = parse_ip_packet_in_ethernet_frame::<Ipv4>(ETHERNET_FRAME.bytes).unwrap().0;
+        let bytes = parse_ip_packet_in_ethernet_frame::<Ipv4>(
+            ETHERNET_FRAME.bytes,
+            EthernetFrameLengthCheck::Check,
+        )
+        .unwrap()
+        .0;
 
         b.iter(|| {
             let buf = bytes;

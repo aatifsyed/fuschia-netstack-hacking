@@ -8,10 +8,10 @@ use alloc::vec::Vec;
 use core::num::NonZeroU16;
 use core::ops::Range;
 
-use log::debug;
 use net_types::ethernet::Mac;
 use net_types::ip::{Ipv4Addr, Ipv6Addr};
 use packet::{ParsablePacket, ParseBuffer};
+use tracing::debug;
 
 use crate::error::{IpParseResult, ParseError, ParseResult};
 use crate::ethernet::{EtherType, EthernetFrame, EthernetFrameLengthCheck};
@@ -167,8 +167,11 @@ pub fn verify_tcp_segment(segment: &TcpSegment<&[u8]>, expected: TestPacket<TcpS
 ///
 /// `parse_ethernet_frame` parses an ethernet frame, returning the body along
 /// with some important header fields.
-pub fn parse_ethernet_frame(mut buf: &[u8]) -> ParseResult<(&[u8], Mac, Mac, Option<EtherType>)> {
-    let frame = (&mut buf).parse_with::<_, EthernetFrame<_>>(EthernetFrameLengthCheck::Check)?;
+pub fn parse_ethernet_frame(
+    mut buf: &[u8],
+    ethernet_length_check: EthernetFrameLengthCheck,
+) -> ParseResult<(&[u8], Mac, Mac, Option<EtherType>)> {
+    let frame = (&mut buf).parse_with::<_, EthernetFrame<_>>(ethernet_length_check)?;
     let src_mac = frame.src_mac();
     let dst_mac = frame.dst_mac();
     let ethertype = frame.ethertype();
@@ -207,7 +210,7 @@ pub fn parse_ip_packet<I: IpExt>(
 pub fn parse_icmp_packet<
     I: IcmpIpExt,
     C,
-    M: for<'a> IcmpMessage<I, &'a [u8], Code = C>,
+    M: IcmpMessage<I, Code = C>,
     F: for<'a> FnOnce(&IcmpPacket<I, &'a [u8], M>),
 >(
     mut buf: &[u8],
@@ -235,8 +238,9 @@ where
 #[allow(clippy::type_complexity)]
 pub fn parse_ip_packet_in_ethernet_frame<I: IpExt>(
     buf: &[u8],
+    ethernet_length_check: EthernetFrameLengthCheck,
 ) -> IpParseResult<I, (&[u8], Mac, Mac, I::Addr, I::Addr, I::Proto, u8)> {
-    let (body, src_mac, dst_mac, ethertype) = parse_ethernet_frame(buf)?;
+    let (body, src_mac, dst_mac, ethertype) = parse_ethernet_frame(buf, ethernet_length_check)?;
     if ethertype != Some(I::ETHER_TYPE) {
         debug!("unexpected ethertype: {:?}", ethertype);
         return Err(ParseError::NotExpected.into());
@@ -256,10 +260,11 @@ pub fn parse_ip_packet_in_ethernet_frame<I: IpExt>(
 pub fn parse_icmp_packet_in_ip_packet_in_ethernet_frame<
     I: IpExt,
     C,
-    M: for<'a> IcmpMessage<I, &'a [u8], Code = C>,
+    M: IcmpMessage<I, Code = C>,
     F: for<'a> FnOnce(&IcmpPacket<I, &'a [u8], M>),
 >(
     buf: &[u8],
+    ethernet_length_check: EthernetFrameLengthCheck,
     f: F,
 ) -> IpParseResult<I, (Mac, Mac, I::Addr, I::Addr, u8, M, C)>
 where
@@ -267,7 +272,7 @@ where
         ParsablePacket<&'a [u8], IcmpParseArgs<I::Addr>, Error = ParseError>,
 {
     let (body, src_mac, dst_mac, src_ip, dst_ip, proto, ttl) =
-        parse_ip_packet_in_ethernet_frame::<I>(buf)?;
+        parse_ip_packet_in_ethernet_frame::<I>(buf, ethernet_length_check)?;
     if proto != I::ICMP_IP_PROTO {
         debug!("unexpected IP protocol: {} (wanted {})", proto, I::ICMP_IP_PROTO);
         return Err(ParseError::NotExpected.into());
@@ -280,24 +285,6 @@ where
 mod crateonly {
     use std::sync::Once;
 
-    /// log::Log implementation that uses stdout.
-    ///
-    /// Useful when debugging tests.
-    struct Logger;
-
-    impl log::Log for Logger {
-        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn log(&self, record: &log::Record<'_>) {
-            println!("{}", record.args())
-        }
-
-        fn flush(&self) {}
-    }
-
-    static LOGGER: Logger = Logger;
     static LOGGER_ONCE: Once = Once::new();
 
     /// Install a logger for tests.
@@ -306,11 +293,13 @@ mod crateonly {
     /// This function sets global program state, so all tests that run after this
     /// function is called will use the logger.
     pub(crate) fn set_logger_for_test() {
-        // log::set_logger will panic if called multiple times; using a Once makes
+        // `init` will panic if called multiple times; using a Once makes
         // set_logger_for_test idempotent
         LOGGER_ONCE.call_once(|| {
-            log::set_logger(&LOGGER).unwrap();
-            log::set_max_level(log::LevelFilter::Trace);
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stdout)
+                .with_max_level(tracing::Level::TRACE)
+                .init();
         })
     }
 
@@ -370,7 +359,7 @@ mod tests {
     fn test_parse_ethernet_frame() {
         use crate::testdata::arp_request::*;
         let (body, src_mac, dst_mac, ethertype) =
-            parse_ethernet_frame(ETHERNET_FRAME.bytes).unwrap();
+            parse_ethernet_frame(ETHERNET_FRAME.bytes, EthernetFrameLengthCheck::Check).unwrap();
         assert_eq!(body, &ETHERNET_FRAME.bytes[14..]);
         assert_eq!(src_mac, ETHERNET_FRAME.metadata.src_mac);
         assert_eq!(dst_mac, ETHERNET_FRAME.metadata.dst_mac);
@@ -401,7 +390,11 @@ mod tests {
     fn test_parse_ip_packet_in_ethernet_frame() {
         use crate::testdata::tls_client_hello_v4::*;
         let (body, src_mac, dst_mac, src_ip, dst_ip, proto, ttl) =
-            parse_ip_packet_in_ethernet_frame::<Ipv4>(ETHERNET_FRAME.bytes).unwrap();
+            parse_ip_packet_in_ethernet_frame::<Ipv4>(
+                ETHERNET_FRAME.bytes,
+                EthernetFrameLengthCheck::Check,
+            )
+            .unwrap();
         assert_eq!(body, &IPV4_PACKET.bytes[IPV4_PACKET.body_range]);
         assert_eq!(src_mac, ETHERNET_FRAME.metadata.src_mac);
         assert_eq!(dst_mac, ETHERNET_FRAME.metadata.dst_mac);
@@ -433,6 +426,7 @@ mod tests {
         let (src_mac, dst_mac, src_ip, dst_ip, _, _, _) =
             parse_icmp_packet_in_ip_packet_in_ethernet_frame::<Ipv4, _, IcmpEchoReply, _>(
                 &REPLY_ETHERNET_FRAME_BYTES,
+                EthernetFrameLengthCheck::Check,
                 |_| {},
             )
             .unwrap();

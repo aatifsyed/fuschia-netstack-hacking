@@ -16,11 +16,13 @@
 /// - `$has_body` - `true` or `false` depending on whether this message type
 ///   supports a body
 macro_rules! impl_icmp_message {
-    ($ip:ident, $type:ident, $msg_variant:ident, $code:tt, $body_type:ty) => {
-        impl<B: ByteSlice> crate::icmp::IcmpMessage<$ip, B> for $type {
+    ($ip:ident, $type:ident, $msg_variant:ident, $code:tt, $body_type:ty, $expects_body:ident) => {
+        impl crate::icmp::IcmpMessage<$ip> for $type {
+            const EXPECTS_BODY: bool = $expects_body;
+
             type Code = $code;
 
-            type Body = $body_type;
+            type Body<B: ByteSlice> = $body_type;
 
             const TYPE: <$ip as IcmpIpExt>::IcmpMessageType =
                 impl_icmp_message_inner_message_type!($ip, $msg_variant);
@@ -31,8 +33,38 @@ macro_rules! impl_icmp_message {
         }
     };
 
+    ($ip:ident, $type:ident, $msg_variant:ident, $code:tt, $body_type:ty) => {
+        impl_icmp_message!($ip, $type, $msg_variant, $code, $body_type, true);
+    };
+
     ($ip:ident, $type:ident, $msg_variant:ident, $code:tt) => {
-        impl_icmp_message!($ip, $type, $msg_variant, $code, ());
+        impl_icmp_message!($ip, $type, $msg_variant, $code, crate::icmp::EmptyMessage<B>, false);
+    };
+}
+
+macro_rules! impl_common_icmp_message {
+    ($type:ident, $icmp_type:ident, $code:tt, $body_type:ty, $expects_body:ident) => {
+        impl<I: crate::icmp::IcmpIpExt> crate::icmp::IcmpMessage<I> for $type {
+            const EXPECTS_BODY: bool = $expects_body;
+
+            type Code = $code;
+
+            type Body<B: zerocopy::ByteSlice> = $body_type;
+
+            const TYPE: I::IcmpMessageType = I::$icmp_type;
+
+            fn code_from_u8(u: u8) -> Option<Self::Code> {
+                impl_icmp_message_inner_code_from_u8!($code, u)
+            }
+        }
+    };
+
+    ($type:ident, $icmp_type:ident, $code:tt, $body_type:ty) => {
+        impl_common_icmp_message!($type, $icmp_type, $code, $body_type, true);
+    };
+
+    ($type:ident, $icmp_type:ident, $code:tt) => {
+        impl_common_icmp_message!($type, $icmp_type, $code, crate::icmp::EmptyMessage<B>, false);
     };
 }
 

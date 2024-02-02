@@ -15,18 +15,18 @@ use core::fmt::{self, Debug, Formatter};
 use core::ops::Range;
 
 use internet_checksum::Checksum;
-use log::debug;
 use net_types::ip::{Ipv4, Ipv4Addr, Ipv6Addr};
 use packet::records::options::OptionSequenceBuilder;
 use packet::records::options::OptionsRaw;
 use packet::{
-    BufferProvider, BufferView, BufferViewMut, EmptyBuf, FromRaw, InnerPacketBuilder, MaybeParsed,
-    NestedPacketBuilder, PacketBuilder, PacketConstraints, ParsablePacket, ParseMetadata,
-    SerializeBuffer, SerializeError, Serializer, TargetBuffer,
+    BufferProvider, BufferView, BufferViewMut, EmptyBuf, FragmentedBytesMut, FromRaw,
+    GrowBufferMut, InnerPacketBuilder, MaybeParsed, PacketBuilder, PacketConstraints,
+    ParsablePacket, ParseMetadata, SerializeError, SerializeTarget, Serializer,
 };
+use tracing::debug;
 use zerocopy::{
-    byteorder::network_endian::U16, AsBytes, ByteSlice, ByteSliceMut, FromBytes, LayoutVerified,
-    Unaligned,
+    byteorder::network_endian::U16, AsBytes, ByteSlice, ByteSliceMut, FromBytes, FromZeros, NoCell,
+    Ref, Unaligned,
 };
 
 use crate::error::{IpParseError, IpParseResult, ParseError};
@@ -62,7 +62,7 @@ pub enum Ipv4FragmentType {
 
 /// The prefix of the IPv4 header which precedes any header options and the
 /// body.
-#[derive(FromBytes, AsBytes, Unaligned)]
+#[derive(FromZeros, FromBytes, AsBytes, NoCell, Unaligned)]
 #[repr(C)]
 pub struct HeaderPrefix {
     version_ihl: u8,
@@ -234,7 +234,7 @@ pub struct Ipv4OnlyMeta {
 /// `Ipv4PacketBuilder` - maintains the invariant that the checksum is always
 /// valid.
 pub struct Ipv4Packet<B> {
-    hdr_prefix: LayoutVerified<B, HeaderPrefix>,
+    hdr_prefix: Ref<B, HeaderPrefix>,
     options: Options<B>,
     body: B,
 }
@@ -262,7 +262,7 @@ impl<B: ByteSlice> FromRaw<Ipv4PacketRaw<B>, ()> for Ipv4Packet<B> {
     type Error = IpParseError<Ipv4>;
 
     fn try_from_raw_with(raw: Ipv4PacketRaw<B>, _args: ()) -> Result<Self, Self::Error> {
-        // TODO(https://fxbug.dev/77598): Some of the errors below should return an
+        // TODO(https://fxbug.dev/42157630): Some of the errors below should return an
         // `IpParseError::ParameterProblem` instead of a `ParseError`.
         let hdr_prefix = raw.hdr_prefix;
         let hdr_bytes = (hdr_prefix.ihl() * 4) as usize;
@@ -422,14 +422,13 @@ impl<B: ByteSlice> Ipv4Packet<B> {
             O: Serializer<Buffer = EmptyBuf>,
         {
             type Buffer = EmptyBuf;
-            fn serialize<B, PB, P>(
+            fn serialize<B, P>(
                 self,
-                outer: PB,
+                outer: PacketConstraints,
                 provider: P,
             ) -> Result<B, (SerializeError<P::Error>, Self)>
             where
-                B: TargetBuffer,
-                PB: NestedPacketBuilder,
+                B: GrowBufferMut,
                 P: BufferProvider<Self::Buffer, B>,
             {
                 match self {
@@ -584,7 +583,7 @@ where
 /// [`Ipv4Packet`] provides a [`FromRaw`] implementation that can be used to
 /// validate an `Ipv4PacketRaw`.
 pub struct Ipv4PacketRaw<B> {
-    hdr_prefix: LayoutVerified<B, HeaderPrefix>,
+    hdr_prefix: Ref<B, HeaderPrefix>,
     options: MaybeParsed<OptionsRaw<B, Ipv4OptionsImpl>, B>,
     body: MaybeParsed<B, B>,
 }
@@ -701,15 +700,18 @@ where
         PacketConstraints::new(header_len, 0, 0, (1 << 16) - 1 - header_len)
     }
 
-    fn serialize(&self, buffer: &mut SerializeBuffer<'_, '_>) {
-        let (mut header, _body, _footer) = buffer.parts();
-        // Implements BufferViewMut.
-        let mut header = &mut header;
+    fn serialize(&self, target: &mut SerializeTarget<'_>, body: FragmentedBytesMut<'_, '_>) {
         let opt_len = self.aligned_options_len();
+        // `take_back_zero` consumes the extent of the receiving slice, but that
+        // behavior is undesirable here: `prefix_builder.serialize` also needs
+        // to write into the header. To avoid changing the extent of
+        // target.header, we re-slice header before calling `take_back_zero`;
+        // the re-slice will be consumed, but `target.header` is unaffected.
+        let mut header = &mut &mut target.header[..];
         let opts = header.take_back_zero(opt_len).expect("too few bytes for Ipv4 options");
         let Ipv4PacketBuilderWithOptions { prefix_builder, options } = self;
         options.serialize_into(opts);
-        prefix_builder.serialize(buffer);
+        prefix_builder.serialize(target, body);
     }
 }
 
@@ -807,12 +809,10 @@ impl PacketBuilder for Ipv4PacketBuilder {
         PacketConstraints::new(IPV4_MIN_HDR_LEN, 0, 0, (1 << 16) - 1 - IPV4_MIN_HDR_LEN)
     }
 
-    fn serialize(&self, buffer: &mut SerializeBuffer<'_, '_>) {
-        let (mut header, body, _footer) = buffer.parts();
-
-        let total_len = header.len() + body.len();
-        assert_eq!(header.len() % 4, 0);
-        let ihl: u8 = u8::try_from(header.len() / 4).expect("Header too large");
+    fn serialize(&self, target: &mut SerializeTarget<'_>, body: FragmentedBytesMut<'_, '_>) {
+        let total_len = target.header.len() + body.len();
+        assert_eq!(target.header.len() % 4, 0);
+        let ihl: u8 = u8::try_from(target.header.len() / 4).expect("Header too large");
 
         // As Per [RFC 6864 Section 2]:
         //
@@ -855,10 +855,10 @@ impl PacketBuilder for Ipv4PacketBuilder {
             self.dst_ip,
         );
 
-        let options = &header[HDR_PREFIX_LEN..];
+        let options = &target.header[HDR_PREFIX_LEN..];
         let checksum = compute_header_checksum(hdr_prefix.as_bytes(), options);
         hdr_prefix.hdr_checksum = checksum;
-        let mut header = &mut header;
+        let mut header = &mut target.header;
         header.write_obj_front(&hdr_prefix).expect("too few bytes for IPv4 header prefix");
     }
 }
@@ -917,7 +917,7 @@ pub(crate) fn reassemble_fragmented_packet<
 
     // We know the call to `unwrap` will not fail because we just copied the header
     // bytes into `bytes`.
-    let mut header = LayoutVerified::<_, HeaderPrefix>::new_unaligned_from_prefix(bytes).unwrap().0;
+    let mut header = Ref::<_, HeaderPrefix>::new_unaligned_from_prefix(bytes).unwrap().0;
 
     // Update the total length field.
     header.total_len.set(u16::try_from(byte_count).unwrap());
@@ -1128,6 +1128,7 @@ mod tests {
     use super::*;
     use crate::ethernet::{
         EtherType, EthernetFrame, EthernetFrameBuilder, EthernetFrameLengthCheck,
+        ETHERNET_MIN_BODY_LEN_NO_TAG,
     };
     use crate::ip::IpProto;
     use crate::testutil::*;
@@ -1186,12 +1187,7 @@ mod tests {
     }
 
     fn hdr_prefix_to_bytes(hdr_prefix: HeaderPrefix) -> [u8; 20] {
-        let mut bytes = [0; 20];
-        {
-            let mut lv = LayoutVerified::<_, HeaderPrefix>::new_unaligned(&mut bytes[..]).unwrap();
-            *lv = hdr_prefix;
-        }
-        bytes
+        zerocopy::transmute!(hdr_prefix)
     }
 
     // Return a new HeaderPrefix with reasonable defaults, including a valid
@@ -1239,6 +1235,7 @@ mod tests {
                 DEFAULT_SRC_MAC,
                 DEFAULT_DST_MAC,
                 EtherType::Ipv4,
+                ETHERNET_MIN_BODY_LEN_NO_TAG,
             ))
             .serialize_vec_outer()
             .unwrap();

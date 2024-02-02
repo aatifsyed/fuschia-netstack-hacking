@@ -9,7 +9,9 @@ use core::fmt;
 
 use net_types::ip::{Ipv6, Ipv6Addr};
 use packet::{BufferView, ParsablePacket, ParseMetadata};
-use zerocopy::{byteorder::network_endian::U32, AsBytes, ByteSlice, FromBytes, Unaligned};
+use zerocopy::{
+    byteorder::network_endian::U32, AsBytes, ByteSlice, FromBytes, FromZeros, NoCell, Unaligned,
+};
 
 use crate::error::{ParseError, ParseResult};
 
@@ -177,10 +179,6 @@ impl IcmpMessageType for Icmpv6MessageType {
     }
 }
 
-impl_icmp_message!(Ipv6, IcmpEchoRequest, EchoRequest, IcmpUnusedCode, OriginalPacket<B>);
-
-impl_icmp_message!(Ipv6, IcmpEchoReply, EchoReply, IcmpUnusedCode, OriginalPacket<B>);
-
 create_protocol_enum!(
     #[allow(missing_docs)]
     #[derive(Copy, Clone, PartialEq, Eq)]
@@ -204,7 +202,7 @@ impl_icmp_message!(
 );
 
 /// An ICMPv6 Packet Too Big message.
-#[derive(Copy, Clone, Debug, FromBytes, AsBytes, Unaligned, PartialEq)]
+#[derive(Copy, Clone, Debug, FromZeros, FromBytes, AsBytes, NoCell, Unaligned, PartialEq)]
 #[repr(C)]
 pub struct Icmpv6PacketTooBig {
     mtu: U32,
@@ -246,7 +244,7 @@ create_protocol_enum!(
 );
 
 /// An ICMPv6 Parameter Problem message.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, FromBytes, AsBytes, Unaligned)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, FromZeros, FromBytes, AsBytes, NoCell, Unaligned)]
 #[repr(C)]
 pub struct Icmpv6ParameterProblem {
     pointer: U32,
@@ -281,7 +279,7 @@ mod tests {
     use crate::icmp::{IcmpMessage, IcmpPacket, MessageBody};
     use crate::ipv6::{Ipv6Header, Ipv6Packet, Ipv6PacketBuilder};
 
-    fn serialize_to_bytes<B: ByteSlice + Debug, M: IcmpMessage<Ipv6, B> + Debug>(
+    fn serialize_to_bytes<B: ByteSlice + Debug, M: IcmpMessage<Ipv6> + Debug>(
         src_ip: Ipv6Addr,
         dst_ip: Ipv6Addr,
         icmp: &IcmpPacket<Ipv6, B, M>,
@@ -299,7 +297,7 @@ mod tests {
     }
 
     fn test_parse_and_serialize<
-        M: for<'a> IcmpMessage<Ipv6, &'a [u8]> + Debug,
+        M: IcmpMessage<Ipv6> + Debug,
         F: for<'a> FnOnce(&IcmpPacket<Ipv6, &'a [u8], M>),
     >(
         mut req: &[u8],

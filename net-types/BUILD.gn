@@ -15,6 +15,7 @@ common_sources = [
   "src/ip.rs",
   "src/lib.rs",
 ]
+common_test_deps = [ "//third_party/rust_crates:test-case" ]
 
 rustc_library("net-types") {
   name = "net-types"
@@ -24,6 +25,7 @@ rustc_library("net-types") {
 
   deps = common_deps
   sources = common_sources
+  test_deps = common_test_deps
 
   features = [ "std" ]
 
@@ -38,6 +40,7 @@ rustc_library("net-types-nostd") {
 
   deps = common_deps
   sources = common_sources
+  test_deps = common_test_deps
 
   features = []
 
@@ -45,6 +48,7 @@ rustc_library("net-types-nostd") {
   # enabled in our build system in order to ensure that net-types continues to
   # compile and pass tests when the "std" feature is disabled.
   visibility = [ ":*" ]
+  disable_rustdoc = true
 
   configs -= [ "//build/config/rust/lints:allow_unused_results" ]
 }
@@ -54,6 +58,7 @@ rustc_macro("net-types-macros") {
   version = "0.1.0"
   edition = "2021"
   deps = [
+    "//third_party/rust_crates:assert_matches",
     "//third_party/rust_crates:proc-macro2",
     "//third_party/rust_crates:quote",
     "//third_party/rust_crates:syn",

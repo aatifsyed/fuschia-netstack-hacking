@@ -16,17 +16,17 @@ use core::convert::TryFrom;
 use core::fmt::{self, Debug, Formatter};
 use core::ops::Range;
 
-use log::debug;
 use net_types::ip::{Ipv4Addr, Ipv6, Ipv6Addr, Ipv6SourceAddr};
 use packet::records::{AlignedRecordSequenceBuilder, Records, RecordsRaw};
 use packet::{
-    BufferProvider, BufferView, BufferViewMut, EmptyBuf, FromRaw, InnerPacketBuilder, MaybeParsed,
-    NestedPacketBuilder, PacketBuilder, PacketConstraints, ParsablePacket, ParseMetadata,
-    SerializeBuffer, SerializeError, Serializer, TargetBuffer,
+    BufferProvider, BufferView, BufferViewMut, EmptyBuf, FragmentedBytesMut, FromRaw,
+    GrowBufferMut, InnerPacketBuilder, MaybeParsed, PacketBuilder, PacketConstraints,
+    ParsablePacket, ParseMetadata, SerializeError, SerializeTarget, Serializer,
 };
+use tracing::debug;
 use zerocopy::{
-    byteorder::network_endian::U16, AsBytes, ByteSlice, ByteSliceMut, FromBytes, LayoutVerified,
-    Unaligned,
+    byteorder::network_endian::U16, AsBytes, ByteSlice, ByteSliceMut, FromBytes, FromZeros, NoCell,
+    Ref, Unaligned,
 };
 
 use crate::error::{IpParseError, IpParseErrorAction, IpParseResult, ParseError};
@@ -175,7 +175,7 @@ fn ext_hdr_err_fn(hdr: &FixedHeader, err: Ipv6ExtensionHeaderParsingError) -> Ip
 }
 
 /// The IPv6 fixed header which precedes any extension headers and the body.
-#[derive(Debug, Default, FromBytes, AsBytes, Unaligned, PartialEq)]
+#[derive(Debug, Default, FromZeros, FromBytes, AsBytes, NoCell, Unaligned, PartialEq)]
 #[repr(C)]
 pub struct FixedHeader {
     version_tc_flowlabel: [u8; 4],
@@ -279,7 +279,7 @@ pub trait Ipv6Header {
 /// parsed from or serialized to, meaning that no copying or extra allocation is
 /// necessary.
 pub struct Ipv6Packet<B> {
-    fixed_hdr: LayoutVerified<B, FixedHeader>,
+    fixed_hdr: Ref<B, FixedHeader>,
     extension_hdrs: Records<B, Ipv6ExtensionHeaderImpl>,
     body: B,
     proto: Ipv6Proto,
@@ -417,7 +417,7 @@ impl<B: ByteSlice> Ipv6Packet<B> {
     /// Unlike [`IpHeader::src_ip`], `src_ipv6` returns an `Ipv6SourceAddr`,
     /// which represents the valid values that a source address can take
     /// (namely, a unicast or unspecified address) or `None` if the address is
-    /// invalid (namely, a multicast address).
+    /// invalid (namely, a multicast address or an ipv4-mapped-ipv6 address).
     pub fn src_ipv6(&self) -> Option<Ipv6SourceAddr> {
         Ipv6SourceAddr::new(self.fixed_hdr.src_ip)
     }
@@ -596,14 +596,13 @@ impl<B: ByteSlice> Ipv6Packet<B> {
             O: Serializer<Buffer = EmptyBuf>,
         {
             type Buffer = EmptyBuf;
-            fn serialize<B, PB, P>(
+            fn serialize<B, P>(
                 self,
-                outer: PB,
+                outer: PacketConstraints,
                 provider: P,
             ) -> Result<B, (SerializeError<P::Error>, Self)>
             where
-                B: TargetBuffer,
-                PB: NestedPacketBuilder,
+                B: GrowBufferMut,
                 P: BufferProvider<Self::Buffer, B>,
             {
                 match self {
@@ -620,7 +619,7 @@ impl<B: ByteSlice> Ipv6Packet<B> {
             }
         }
 
-        // TODO(https://fxbug.dev/92381): Add support for fragmented packets
+        // TODO(https://fxbug.dev/42174049): Add support for fragmented packets
         // forwarding.
         if self.fragment_header_present() {
             return Nat64TranslationResult::Err(Nat64Error::NotImplemented);
@@ -645,7 +644,7 @@ impl<B: ByteSlice> Ipv6Packet<B> {
             //        otherwise, it is set to one."
             builder.df_flag(self.body().len() + IPV4_HEADER_LEN_BYTES > 1260);
 
-            // TODO(https://fxbug.dev/92381): This needs an update once
+            // TODO(https://fxbug.dev/42174049): This needs an update once
             // we don't return early for fragment_header_present case.
             builder.fragment_offset(0);
             builder.mf_flag(false);
@@ -657,7 +656,7 @@ impl<B: ByteSlice> Ipv6Packet<B> {
             Ipv6Proto::Proto(IpProto::Tcp) => {
                 let v4_pkt_builder = v4_builder(Ipv4Proto::Proto(IpProto::Tcp));
                 let args = TcpParseArgs::new(self.src_ip(), self.dst_ip());
-                // TODO(https://fxbug.dev/92701): We're doing roughly similar work
+                // TODO(https://fxbug.dev/42174405): We're doing roughly similar work
                 // in valid/invalid parsing case. Remove match statement and
                 // update the checksum in place without needing to parse the TCP
                 // segment once we have ability to update the checksum.
@@ -690,7 +689,7 @@ impl<B: ByteSlice> Ipv6Packet<B> {
                 }
             }
 
-            // TODO(https://fxbug.dev/92701): We're doing roughly similar work
+            // TODO(https://fxbug.dev/42174405): We're doing roughly similar work
             // in valid/invalid parsing case. Remove match statement and
             // update the checksum in place without needing to parse the UDP segment
             // once we have ability to update checksum.
@@ -727,7 +726,7 @@ impl<B: ByteSlice> Ipv6Packet<B> {
                 }
             }
 
-            // TODO(https://fxbug.dev/92383): Implement ICMP packet translation
+            // TODO(https://fxbug.dev/42174051): Implement ICMP packet translation
             // support here.
             Ipv6Proto::Icmpv6 => Nat64TranslationResult::Err(Nat64Error::NotImplemented),
 
@@ -807,7 +806,7 @@ pub struct ExtHdrParseError;
 /// validate an `Ipv6PacketRaw`.
 pub struct Ipv6PacketRaw<B> {
     /// A raw packet always contains at least a fully parsed `FixedHeader`.
-    fixed_hdr: LayoutVerified<B, FixedHeader>,
+    fixed_hdr: Ref<B, FixedHeader>,
     /// When `extension_hdrs` is [`MaybeParsed::Complete`], it contains the
     /// `RecordsRaw` that can be validated for full extension headers parsing.
     /// Otherwise, it just contains the extension header bytes that were
@@ -1102,9 +1101,8 @@ impl PacketBuilder for Ipv6PacketBuilder {
         PacketConstraints::new(IPV6_FIXED_HDR_LEN, 0, 0, (1 << 16) - 1)
     }
 
-    fn serialize(&self, buffer: &mut SerializeBuffer<'_, '_>) {
-        let (mut header, body, _) = buffer.parts();
-        self.serialize_fixed_hdr(&mut header, body.len(), self.proto.into());
+    fn serialize(&self, target: &mut SerializeTarget<'_>, body: FragmentedBytesMut<'_, '_>) {
+        self.serialize_fixed_hdr(&mut target.header, body.len(), self.proto.into());
     }
 }
 
@@ -1132,13 +1130,16 @@ where
         PacketConstraints::new(header_len, 0, 0, (1 << 16) - 1)
     }
 
-    fn serialize(&self, buffer: &mut SerializeBuffer<'_, '_>) {
-        let (mut header, body, _) = buffer.parts();
+    fn serialize(&self, target: &mut SerializeTarget<'_>, body: FragmentedBytesMut<'_, '_>) {
         let aligned_hbh_len = self.aligned_hbh_len();
         // The next header in the fixed header now should be 0 (Hop-by-Hop Extension Header)
-        self.prefix_builder.serialize_fixed_hdr(&mut header, body.len() + aligned_hbh_len, 0);
+        self.prefix_builder.serialize_fixed_hdr(
+            &mut target.header,
+            body.len() + aligned_hbh_len,
+            0,
+        );
         // header implements BufferViewMut
-        let mut header = &mut header;
+        let mut header = &mut target.header;
         let mut hbh_extension_header = header
             .take_back_zero(aligned_hbh_len)
             .expect("too few bytes for Hop-by-Hop extension header");
@@ -1201,7 +1202,7 @@ pub(crate) fn reassemble_fragmented_packet<
 
     // We know the call to `unwrap` will not fail because we just copied the header
     // bytes into `bytes`.
-    let mut header = LayoutVerified::<_, FixedHeader>::new_unaligned_from_prefix(bytes).unwrap().0;
+    let mut header = Ref::<_, FixedHeader>::new_unaligned_from_prefix(bytes).unwrap().0;
 
     // Update the payload length field.
     header.payload_len.set(u16::try_from(payload_length).unwrap());
@@ -1275,12 +1276,7 @@ mod tests {
     }
 
     fn fixed_hdr_to_bytes(fixed_hdr: FixedHeader) -> [u8; IPV6_FIXED_HDR_LEN] {
-        let mut bytes = [0; IPV6_FIXED_HDR_LEN];
-        {
-            let mut lv = LayoutVerified::<_, FixedHeader>::new_unaligned(&mut bytes[..]).unwrap();
-            *lv = fixed_hdr;
-        }
-        bytes
+        zerocopy::transmute!(fixed_hdr)
     }
 
     // Return a new FixedHeader with reasonable defaults.
@@ -1641,7 +1637,7 @@ mod tests {
         let Ipv6PacketRaw { fixed_hdr, extension_hdrs, body_proto } = &partial;
         assert_eq!(fixed_hdr.deref(), &make_fixed_hdr());
         assert_eq!(
-            extension_hdrs.as_ref().incomplete().unwrap().deref(),
+            *extension_hdrs.as_ref().incomplete().unwrap(),
             [IpProto::Tcp.into(), MALFORMED_BYTE]
         );
         assert_eq!(body_proto, &Err(ExtHdrParseError));

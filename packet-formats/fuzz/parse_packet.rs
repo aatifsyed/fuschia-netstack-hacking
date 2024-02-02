@@ -23,12 +23,21 @@ use packet_formats::{
     udp::{UdpPacket, UdpParseArgs},
 };
 use packet_formats_dhcp::v6::Message as Dhcpv6Message;
+use tracing::Subscriber;
+use tracing_subscriber::{
+    fmt::{
+        format::{self, FormatEvent, FormatFields},
+        FmtContext,
+    },
+    registry::LookupSpan,
+};
 use zerocopy::ByteSlice;
 
 /// Packet formats whose parsers are provided by the [`packet_formats_dhcp`]
 /// crate.
 #[derive(Arbitrary)]
 enum DhcpPacketType {
+    Dhcpv4Message,
     Dhcpv6Message,
 }
 
@@ -92,24 +101,32 @@ where
 fn init_logging() {
     static LOGGER_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
     if LOGGER_ONCE.swap(false, core::sync::atomic::Ordering::AcqRel) {
-        struct StderrLogger;
-        impl log::Log for StderrLogger {
-            fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
-                true
+        struct LogEventFormatter;
+        impl<S, N> FormatEvent<S, N> for LogEventFormatter
+        where
+            S: Subscriber + for<'a> LookupSpan<'a>,
+            N: for<'a> FormatFields<'a> + 'static,
+        {
+            fn format_event(
+                &self,
+                ctx: &FmtContext<'_, S, N>,
+                mut writer: format::Writer<'_>,
+                event: &tracing::Event<'_>,
+            ) -> std::fmt::Result {
+                let level = *event.metadata().level();
+                let path = event.metadata().module_path().unwrap_or("_unknown_");
+                write!(writer, "[{path}][{level}]: ")?;
+                ctx.field_format().format_fields(writer.by_ref(), event)?;
+                writeln!(writer)
             }
-            fn log(&self, record: &log::Record<'_>) {
-                eprintln!(
-                    "[{}][{}] {}",
-                    record.module_path().unwrap_or("_unknown_"),
-                    record.level(),
-                    record.args()
-                );
-            }
-            fn flush(&self) {}
         }
-        static LOGGER: StderrLogger = StderrLogger;
-        log::set_logger(&LOGGER).expect("logging setup failed");
-        log::set_max_level(log::LevelFilter::Debug);
+
+        let subscriber = tracing_subscriber::fmt()
+            .event_format(LogEventFormatter)
+            .with_writer(std::io::stderr)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("Unable to set global default")
     }
 }
 
@@ -173,6 +190,12 @@ fn fuzz_parse_packet(input: &[u8]) {
         SupportedPacketType::DhcpPacket(dhcp_type) => match dhcp_type {
             DhcpPacketType::Dhcpv6Message => {
                 Dhcpv6Message::parse_and_ignore(&mut input, ());
+            }
+            DhcpPacketType::Dhcpv4Message => {
+                // TODO(https://fxbug.dev/42073571): Migrate dhcp_protocol to packet-formats APIs
+                // and make this use `parse_and_ignore` instead.
+                let _: Result<dhcp_protocol::Message, dhcp_protocol::ProtocolError> =
+                    dhcp_protocol::Message::from_buffer(input);
             }
         },
         SupportedPacketType::MdnsPacket(mdns_type) => match mdns_type {

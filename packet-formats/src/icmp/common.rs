@@ -6,12 +6,14 @@
 
 use core::num::NonZeroU16;
 
-use zerocopy::{byteorder::network_endian::U16, AsBytes, FromBytes, Unaligned};
+use zerocopy::{byteorder::network_endian::U16, AsBytes, FromBytes, FromZeros, NoCell, Unaligned};
 
-use super::IdAndSeq;
+use super::{IcmpUnusedCode, IdAndSeq, OriginalPacket};
 
 /// An ICMP Destination Unreachable message.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, FromBytes, AsBytes, Unaligned)]
+#[derive(
+    Copy, Clone, Debug, Default, Eq, PartialEq, FromZeros, FromBytes, AsBytes, NoCell, Unaligned,
+)]
 #[repr(C)]
 pub struct IcmpDestUnreachable {
     // Rest of Header in ICMP, unused in ICMPv6.
@@ -65,7 +67,7 @@ impl IcmpDestUnreachable {
 }
 
 /// An ICMP Echo Request message.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, FromBytes, AsBytes, Unaligned)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, FromZeros, FromBytes, AsBytes, NoCell, Unaligned)]
 #[repr(C)]
 pub struct IcmpEchoRequest {
     pub(super) id_seq: IdAndSeq,
@@ -99,7 +101,7 @@ impl IcmpEchoRequest {
 }
 
 /// An ICMP Echo Reply message.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, FromBytes, AsBytes, Unaligned)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, FromZeros, FromBytes, AsBytes, NoCell, Unaligned)]
 #[repr(C)]
 pub struct IcmpEchoReply {
     pub(super) id_seq: IdAndSeq,
@@ -125,7 +127,9 @@ impl IcmpEchoReply {
 }
 
 /// An ICMP Time Exceeded message.
-#[derive(Copy, Clone, Default, Debug, Eq, PartialEq, FromBytes, AsBytes, Unaligned)]
+#[derive(
+    Copy, Clone, Default, Debug, Eq, PartialEq, FromZeros, FromBytes, AsBytes, NoCell, Unaligned,
+)]
 #[repr(C)]
 pub struct IcmpTimeExceeded {
     // Rest of Header in ICMP, unused in ICMPv6
@@ -133,3 +137,6 @@ pub struct IcmpTimeExceeded {
     /* Body of IcmpTimeExceeded is entirely variable-length, so is stored in
      * the message_body field in IcmpPacket */
 }
+
+impl_common_icmp_message!(IcmpEchoReply, ECHO_REPLY, IcmpUnusedCode, OriginalPacket<B>);
+impl_common_icmp_message!(IcmpEchoRequest, ECHO_REQUEST, IcmpUnusedCode, OriginalPacket<B>);

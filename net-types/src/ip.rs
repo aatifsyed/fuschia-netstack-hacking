@@ -59,18 +59,18 @@ use core::convert::TryFrom;
 use core::fmt::{self, Debug, Display, Formatter};
 use core::hash::Hash;
 use core::mem;
-use core::ops::Deref;
+use core::ops::{Deref, DerefMut};
 
 #[cfg(feature = "std")]
 use std::net;
 
 pub use net_types_macros::GenericOverIp;
-use zerocopy::{AsBytes, FromBytes, Unaligned};
+use zerocopy::{AsBytes, FromBytes, FromZeros, NoCell, Unaligned};
 
 use crate::{
-    sealed, LinkLocalAddr, LinkLocalAddress, LinkLocalMulticastAddr, LinkLocalUnicastAddr,
-    MulticastAddr, MulticastAddress, Scope, ScopeableAddress, SpecifiedAddr, SpecifiedAddress,
-    UnicastAddr, UnicastAddress, Witness,
+    sealed, LinkLocalAddr, LinkLocalAddress, MappedAddress, MulticastAddr, MulticastAddress,
+    NonMappedAddr, Scope, ScopeableAddress, SpecifiedAddr, SpecifiedAddress, UnicastAddr,
+    UnicastAddress, Witness,
 };
 
 // NOTE on passing by reference vs by value: Clippy advises us to pass IPv4
@@ -80,7 +80,7 @@ use crate::{
 
 /// An IP protocol version.
 #[allow(missing_docs)]
-#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash, PartialOrd, Ord)]
 pub enum IpVersion {
     V4,
     V6,
@@ -93,9 +93,19 @@ pub enum IpVersion {
 /// `IpVersionMarker` behaves similarly to [`PhantomData`].
 ///
 /// [`PhantomData`]: core::marker::PhantomData
-#[derive(Copy, Clone, PartialEq, Eq, Hash, GenericOverIp)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, GenericOverIp)]
+#[generic_over_ip(I, Ip)]
 pub struct IpVersionMarker<I: Ip> {
     _marker: core::marker::PhantomData<I>,
+}
+
+impl<I: Ip> IpVersionMarker<I> {
+    /// Creates a new `IpVersionMarker`.
+    // TODO(https://github.com/rust-lang/rust/issues/67792): Remove once
+    // `const_trait_impl` is stabilized.
+    pub const fn new() -> Self {
+        Self { _marker: core::marker::PhantomData }
+    }
 }
 
 impl<I: Ip> Default for IpVersionMarker<I> {
@@ -119,7 +129,7 @@ impl<I: Ip> Debug for IpVersionMarker<I> {
 /// `IpAddr<SpecifiedAddr<Ipv4Addr>, SpecifiedAddr<Ipv6Addr>>` and
 /// `SpecifiedAddr<IpAddr>`, and similarly for other witness types.
 #[allow(missing_docs)]
-#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash, PartialOrd, Ord)]
 pub enum IpAddr<V4 = Ipv4Addr, V6 = Ipv6Addr> {
     V4(V4),
     V6(V6),
@@ -268,6 +278,9 @@ pub trait Ip:
     /// `V4` for IPv4 and `V6` for IPv6.
     const VERSION: IpVersion;
 
+    /// The zero-sized-type IP version marker.
+    const VERSION_MARKER: IpVersionMarker<Self>;
+
     /// The unspecified address.
     ///
     /// This is 0.0.0.0 for IPv4 and :: for IPv6.
@@ -334,7 +347,6 @@ pub trait Ip:
     /// consider the following:
     ///
     /// ```
-    /// use net_types::ip::{Ip, Ipv4Addr, Ipv6Addr};
     /// // Swaps the order of the addresses only if `I=Ipv4`.
     /// fn swap_only_if_ipv4<I: Ip>(addrs: (I::Addr, I::Addr)) -> (I::Addr, I::Addr) {
     ///    I::map_ip::<(I::Addr, I::Addr), (I::Addr, I::Addr)>(
@@ -356,9 +368,108 @@ pub trait Ip:
         Out: GenericOverIp<Self, Type = Out> + GenericOverIp<Ipv4> + GenericOverIp<Ipv6>,
     >(
         input: In,
-        v4: fn(<In as GenericOverIp<Ipv4>>::Type) -> <Out as GenericOverIp<Ipv4>>::Type,
-        v6: fn(<In as GenericOverIp<Ipv6>>::Type) -> <Out as GenericOverIp<Ipv6>>::Type,
+        v4: impl FnOnce(<In as GenericOverIp<Ipv4>>::Type) -> <Out as GenericOverIp<Ipv4>>::Type,
+        v6: impl FnOnce(<In as GenericOverIp<Ipv6>>::Type) -> <Out as GenericOverIp<Ipv6>>::Type,
     ) -> Out;
+}
+
+/// Invokes `I::map_ip`, passing the same function body as both arguments.
+///
+/// The first argument is always the `I` on which to invoke `I::map_ip`.
+/// Optionally, this can include an alias (`I as IpAlias`) that should be bound
+/// to `Ipv4` and `Ipv6` for each instantiation of the function body. (If the
+/// `Ip` argument passed is a simple identifier, then it is automatically
+/// aliased in this way.)
+/// The next argument is the input to thread through `map_ip` to the function,
+/// and the final argument is the function to be duplicated to serve as the
+/// closures passed to `map_ip`.
+///
+/// This macro helps avoid code duplication when working with types that are
+/// _not_ GenericOverIp, but have identical shapes such that the actual text of
+/// the code you are writing is identical. This should be very rare, and is
+/// generally limited to cases where we are interfacing with code that we don't
+/// have the ability to make generic-over-IP -- when possible, it's better to
+/// push `I: Ip` generics further through the types you are working with instead
+/// so that you can avoid using `map_ip` entirely.
+///
+/// Example:
+///
+/// ```
+/// // Imagine that `IpExt` is implemented for concrete `Ipv4` and `Ipv6` but
+/// // not for blanket `I: Ip`.
+/// struct Foo<I: IpExt>;
+///
+/// struct FooFactory;
+/// impl FooFactory {
+///     fn get<I: IpExt>(&self) -> Foo<I> {
+///         unimplemented!()
+///     }
+/// }
+///
+/// struct FooSink<I: IpExt>;
+/// impl<I: IpExt> FooSink<I> {
+///     fn use_foo(&self, foo: Foo<I>) {
+///         unimplemented!()
+///     }
+/// }
+///
+/// fn do_something<I: Ip>(factory: FooFactory) -> Foo<I> {
+///     map_ip_twice!(
+///         I,
+///         (),
+///         |()| {
+///            // This works because even though the `I` from the function decl
+///            // doesn't have an `IpExt` bound, it's aliased to either `Ipv4`
+///            // or `Ipv6` here.
+///            factory.get::<I>()
+///         },
+///     )
+/// }
+///
+/// fn do_something_else<I: IpExt>(factory: FooFactory, foo_sink: FooSink<I>) {
+///     map_ip_twice!(
+///         // Introduce different alias to avoid shadowing `I`.
+///         I as IpAlias,
+///         (),
+///         |()| {
+///             let foo_with_orig_ip = factory.get::<I>();
+///             // The fact that `I` was not shadowed allows us to make use of
+///             // `foo_sink` by capture rather than needing to thread it
+///             // through the generic-over-IP input.
+///             foo_sink.use_foo(foo_with_orig_ip)
+///         },
+///     )
+/// }
+/// ```
+#[macro_export]
+macro_rules! map_ip_twice {
+    // This case triggers if we're passed an `Ip` implementor that is a simple
+    // identifier in-scope (e.g. `I`), which allows us to automatically alias it
+    // to `Ipv4` and `Ipv6` in each `$fn` instantiation.
+    ($ip:ident, $input:expr, $fn:expr $(,)?) => {
+        $crate::map_ip_twice!($ip as $ip, $input, $fn)
+    };
+    // This case triggers if we're passed an `Ip` implementor that is _not_ an
+    // identifier, and thus we can't use it as the left-hand-side of a type
+    // alias binding (e.g. `<A as IpAddress>::Version`).
+    ($ip:ty, $input:expr, $fn:expr $(,)?) => {
+        <$ip as $crate::ip::Ip>::map_ip($input, { $fn }, { $fn })
+    };
+    ($ip:ty as $iptypealias:ident, $input:expr, $fn:expr $(,)?) => {
+        <$ip as $crate::ip::Ip>::map_ip(
+            $input,
+            {
+                #[allow(dead_code)]
+                type $iptypealias = $crate::ip::Ipv4;
+                $fn
+            },
+            {
+                #[allow(dead_code)]
+                type $iptypealias = $crate::ip::Ipv6;
+                $fn
+            },
+        )
+    };
 }
 
 /// IPv4.
@@ -380,7 +491,9 @@ impl sealed::Sealed for Ipv4 {}
 
 impl Ip for Ipv4 {
     const VERSION: IpVersion = IpVersion::V4;
-    // TODO(https://fxbug.dev/83331): Document the standard in which this
+    const VERSION_MARKER: IpVersionMarker<Self> = IpVersionMarker::new();
+
+    // TODO(https://fxbug.dev/42163997): Document the standard in which this
     // constant is defined.
     const UNSPECIFIED_ADDRESS: Ipv4Addr = Ipv4Addr::new([0, 0, 0, 0]);
     /// The default IPv4 address used for loopback, defined in [RFC 5735 Section
@@ -398,10 +511,10 @@ impl Ip for Ipv4 {
     /// [RFC 1122 Section 3.2.1.3]: https://www.rfc-editor.org/rfc/rfc1122.html#section-3.2.1.3
     const LOOPBACK_SUBNET: Subnet<Ipv4Addr> =
         Subnet { network: Ipv4Addr::new([127, 0, 0, 0]), prefix: 8 };
-    // TODO(https://fxbug.dev/83331): Document the standard in which this
-    // constant is defined.
-    const MULTICAST_SUBNET: Subnet<Ipv4Addr> =
-        Subnet { network: Ipv4Addr::new([224, 0, 0, 0]), prefix: 4 };
+    /// The IPv4 Multicast subnet, defined in [RFC 1112 Section 4].
+    ///
+    /// [RFC 1112 Section 4]: https://www.rfc-editor.org/rfc/rfc1112.html#section-4
+    const MULTICAST_SUBNET: Subnet<Ipv4Addr> = Self::CLASS_D_SUBNET;
     /// The subnet of link-local unicast IPv4 addresses, outlined in [RFC 3927
     /// Section 2.1].
     ///
@@ -423,8 +536,8 @@ impl Ip for Ipv4 {
         Out: GenericOverIp<Self, Type = Out> + GenericOverIp<Ipv4> + GenericOverIp<Ipv6>,
     >(
         input: In,
-        v4: fn(<In as GenericOverIp<Ipv4>>::Type) -> <Out as GenericOverIp<Ipv4>>::Type,
-        _v6: fn(<In as GenericOverIp<Ipv6>>::Type) -> <Out as GenericOverIp<Ipv6>>::Type,
+        v4: impl FnOnce(<In as GenericOverIp<Ipv4>>::Type) -> <Out as GenericOverIp<Ipv4>>::Type,
+        _v6: impl FnOnce(<In as GenericOverIp<Ipv6>>::Type) -> <Out as GenericOverIp<Ipv6>>::Type,
     ) -> Out {
         v4(input)
     }
@@ -442,6 +555,40 @@ impl Ipv4 {
     /// [IANA IPv4 Special-Purpose Address Registry]: https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml
     pub const LIMITED_BROADCAST_ADDRESS: SpecifiedAddr<Ipv4Addr> =
         unsafe { SpecifiedAddr::new_unchecked(Ipv4Addr::new([255, 255, 255, 255])) };
+
+    /// The Class A subnet.
+    ///
+    /// The Class A subnet is defined in [RFC 1812 section 2.2.5.1].
+    ///
+    /// [RFC 1812 section 2.2.5.1]: https://datatracker.ietf.org/doc/html/rfc1812#section-2.2.5.1
+    pub const CLASS_A_SUBNET: Subnet<Ipv4Addr> =
+        Subnet { network: Ipv4Addr::new([0, 0, 0, 0]), prefix: 1 };
+
+    /// The Class B subnet.
+    ///
+    /// The Class B subnet is defined in [RFC 1812 section 2.2.5.1].
+    ///
+    /// [RFC 1812 section 2.2.5.1]: https://datatracker.ietf.org/doc/html/rfc1812#section-2.2.5.1
+    pub const CLASS_B_SUBNET: Subnet<Ipv4Addr> =
+        Subnet { network: Ipv4Addr::new([128, 0, 0, 0]), prefix: 2 };
+
+    /// The Class C subnet.
+    ///
+    /// The Class C subnet is defined in [RFC 1812 section 2.2.5.1].
+    ///
+    /// [RFC 1812 section 2.2.5.1]: https://datatracker.ietf.org/doc/html/rfc1812#section-2.2.5.1
+    pub const CLASS_C_SUBNET: Subnet<Ipv4Addr> =
+        Subnet { network: Ipv4Addr::new([192, 0, 0, 0]), prefix: 3 };
+
+    /// The Class D subnet.
+    ///
+    /// This subnet is also known as the multicast subnet.
+    ///
+    /// The Class D subnet is defined in [RFC 1812 section 2.2.5.1].
+    ///
+    /// [RFC 1812 section 2.2.5.1]: https://datatracker.ietf.org/doc/html/rfc1812#section-2.2.5.1
+    pub const CLASS_D_SUBNET: Subnet<Ipv4Addr> =
+        Subnet { network: Ipv4Addr::new([224, 0, 0, 0]), prefix: 4 };
 
     /// The Class E subnet.
     ///
@@ -496,6 +643,7 @@ impl sealed::Sealed for Ipv6 {}
 
 impl Ip for Ipv6 {
     const VERSION: IpVersion = IpVersion::V6;
+    const VERSION_MARKER: IpVersionMarker<Self> = IpVersionMarker::new();
     /// The unspecified IPv6 address, defined in [RFC 4291 Section 2.5.2].
     ///
     /// Per RFC 4291:
@@ -579,8 +727,8 @@ impl Ip for Ipv6 {
         Out: GenericOverIp<Self, Type = Out> + GenericOverIp<Ipv4> + GenericOverIp<Ipv6>,
     >(
         input: In,
-        _v4: fn(<In as GenericOverIp<Ipv4>>::Type) -> <Out as GenericOverIp<Ipv4>>::Type,
-        v6: fn(<In as GenericOverIp<Ipv6>>::Type) -> <Out as GenericOverIp<Ipv6>>::Type,
+        _v4: impl FnOnce(<In as GenericOverIp<Ipv4>>::Type) -> <Out as GenericOverIp<Ipv4>>::Type,
+        v6: impl FnOnce(<In as GenericOverIp<Ipv6>>::Type) -> <Out as GenericOverIp<Ipv6>>::Type,
     ) -> Out {
         v6(input)
     }
@@ -668,6 +816,8 @@ pub trait IpAddress:
     Sized
     + Eq
     + PartialEq
+    + PartialOrd
+    + Ord
     + Hash
     + Copy
     + Display
@@ -893,6 +1043,31 @@ impl LinkLocalAddress for IpAddr {
     #[inline]
     fn is_link_local(&self) -> bool {
         map_ip_addr!(self, is_link_local)
+    }
+}
+
+impl<A: IpAddress> MappedAddress for A {
+    /// Is this address non-mapped?
+    ///
+    /// For IPv4 addresses, this always returns true because they do not have a
+    /// mapped address space.
+    ///
+    /// For Ipv6 addresses, this returns true if `self` is outside of the IPv4
+    /// mapped Ipv6 address subnet, as defined in [RFC 4291 Section 2.5.5.2]
+    /// (e.g. `::FFFF:0:0/96`).
+    ///
+    /// [RFC 4291 Section 2.5.5.2]: https://tools.ietf.org/html/rfc4291#section-2.5.5.2
+    #[inline]
+    fn is_non_mapped(&self) -> bool {
+        A::Version::map_ip(self, |_addr_v4| true, |addr_v6| addr_v6.to_ipv4_mapped().is_none())
+    }
+}
+
+impl MappedAddress for IpAddr {
+    /// Is this address non-mapped?
+    #[inline]
+    fn is_non_mapped(&self) -> bool {
+        map_ip_addr!(self, is_non_mapped)
     }
 }
 
@@ -1181,7 +1356,7 @@ impl ScopeableAddress for IpAddr {
 /// - `From<$witness<$ipaddr>> for $ipaddr`
 /// - `TryFrom<$ipaddr> for $witness<$ipaddr>`
 macro_rules! impl_from_witness {
-    ($witness:ident) => {
+    ($witness:ident, $witness_trait:ident) => {
         impl From<IpAddr<$witness<Ipv4Addr>, $witness<Ipv6Addr>>> for $witness<IpAddr> {
             fn from(addr: IpAddr<$witness<Ipv4Addr>, $witness<Ipv6Addr>>) -> $witness<IpAddr> {
                 unsafe {
@@ -1214,14 +1389,16 @@ macro_rules! impl_from_witness {
             }
         }
         // NOTE: Orphan rules prevent implementing `From` for `A: IpAddress`.
-        impl From<$witness<Ipv4Addr>> for Ipv4Addr {
-            fn from(addr: $witness<Ipv4Addr>) -> Ipv4Addr {
-                addr.get()
+        impl<A: Into<Ipv4Addr> + $witness_trait + Copy> From<$witness<A>> for Ipv4Addr {
+            fn from(addr: $witness<A>) -> Ipv4Addr {
+                let addr: A = addr.get();
+                addr.into()
             }
         }
-        impl From<$witness<Ipv6Addr>> for Ipv6Addr {
-            fn from(addr: $witness<Ipv6Addr>) -> Ipv6Addr {
-                addr.get()
+        impl<A: Into<Ipv6Addr> + $witness_trait + Copy> From<$witness<A>> for Ipv6Addr {
+            fn from(addr: $witness<A>) -> Ipv6Addr {
+                let addr: A = addr.get();
+                addr.into()
             }
         }
         // NOTE: Orphan rules prevent implementing `TryFrom` for `A: IpAddress`.
@@ -1238,7 +1415,7 @@ macro_rules! impl_from_witness {
             }
         }
     };
-    ($witness:ident, $ipaddr:ident, $new_unchecked:expr) => {
+    ($witness:ident, $witness_trait:ident, $ipaddr:ident, $new_unchecked:expr) => {
         impl From<$witness<$ipaddr>> for $witness<IpAddr> {
             fn from(addr: $witness<$ipaddr>) -> $witness<IpAddr> {
                 let addr: $ipaddr = addr.get();
@@ -1249,9 +1426,10 @@ macro_rules! impl_from_witness {
                 }
             }
         }
-        impl From<$witness<$ipaddr>> for $ipaddr {
-            fn from(addr: $witness<$ipaddr>) -> $ipaddr {
-                addr.get()
+        impl<A: Into<$ipaddr> + $witness_trait + Copy> From<$witness<A>> for $ipaddr {
+            fn from(addr: $witness<A>) -> $ipaddr {
+                let addr: A = addr.get();
+                addr.into()
             }
         }
         impl TryFrom<$ipaddr> for $witness<$ipaddr> {
@@ -1263,12 +1441,91 @@ macro_rules! impl_from_witness {
     };
 }
 
-impl_from_witness!(SpecifiedAddr);
-impl_from_witness!(MulticastAddr);
-impl_from_witness!(LinkLocalAddr);
-impl_from_witness!(LinkLocalMulticastAddr);
-impl_from_witness!(UnicastAddr, Ipv6Addr, UnicastAddr::new_unchecked);
-impl_from_witness!(LinkLocalUnicastAddr, Ipv6Addr, |addr| LinkLocalAddr(UnicastAddr(addr)));
+impl_from_witness!(SpecifiedAddr, SpecifiedAddress);
+impl_from_witness!(MulticastAddr, MulticastAddress);
+impl_from_witness!(LinkLocalAddr, LinkLocalAddress);
+impl_from_witness!(NonMappedAddr, MappedAddress);
+// Only add `From` conversions for `Ipv6Addr`, because `Ipv4Addr` does not
+// implement `UnicastAddress`.
+impl_from_witness!(UnicastAddr, UnicastAddress, Ipv6Addr, UnicastAddr::new_unchecked);
+
+/// The class of an IPv4 address.
+///
+/// The classful addressing scheme is obsoloted in favour of [CIDR] but is still
+/// used on some systems. For more information, see [RFC 791 section 2.3] and
+/// [RFC 1812 section 2.2.5.1].
+///
+/// [CIDR]: https://datatracker.ietf.org/doc/html/rfc1518
+/// [RFC 791 section 2.3]: https://datatracker.ietf.org/doc/html/rfc791#section-2.3
+/// [RFC 1812 section 2.2.5.1]: https://datatracker.ietf.org/doc/html/rfc1812#section-2.2.5.1
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Ipv4AddressClass {
+    /// A Class A IPv4 address.
+    A,
+    /// A Class B IPv4 address.
+    B,
+    /// A Class C IPv4 address.
+    C,
+    /// A Class D IPv4 address.
+    ///
+    /// Class D addresses are also known as multicast.
+    D,
+    /// A Class E IPv4 address.
+    ///
+    /// Class E addresses are also known as experimental.
+    E,
+}
+
+impl Ipv4AddressClass {
+    /// Returns the default prefix length for an IPv4 address class if the
+    /// prefix is well-defined.
+    pub const fn default_prefix_len(self) -> Option<u8> {
+        // Per RFC 943 https://datatracker.ietf.org/doc/html/rfc943
+        //
+        //   The first type of address, or class A, has a 7-bit network number
+        //   and a 24-bit local address.  The highest-order bit is set to 0.
+        //   This allows 128 class A networks.
+        //
+        //                        1                   2                   3
+        //    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+        //   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        //   |0|   NETWORK   |                Local Address                  |
+        //   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        //
+        //                          Class A Address
+        //
+        //   The second type of address, class B, has a 14-bit network number
+        //   and a 16-bit local address.  The two highest-order bits are set to
+        //   1-0.  This allows 16,384 class B networks.
+        //
+        //                        1                   2                   3
+        //    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+        //   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        //   |1 0|           NETWORK         |          Local Address        |
+        //   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        //
+        //                          Class B Address
+        //
+        //   The third type of address, class C, has a 21-bit network number
+        //   and a 8-bit local address.  The three highest-order bits are set
+        //   to 1-1-0.  This allows 2,097,152 class C networks.
+        //
+        //                        1                   2                   3
+        //    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+        //   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        //   |1 1 0|                    NETWORK              | Local Address |
+        //   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        //
+        //                          Class C Address
+        match self {
+            Ipv4AddressClass::A => Some(8),
+            Ipv4AddressClass::B => Some(16),
+            Ipv4AddressClass::C => Some(24),
+            Ipv4AddressClass::D => None,
+            Ipv4AddressClass::E => None,
+        }
+    }
+}
 
 /// An IPv4 address.
 ///
@@ -1292,7 +1549,21 @@ impl_from_witness!(LinkLocalUnicastAddr, Ipv6Addr, |addr| LinkLocalAddr(UnicastA
 ///     gateway: Ipv4Addr,
 /// }
 /// ```
-#[derive(Copy, Clone, Default, PartialEq, Eq, Hash, FromBytes, AsBytes, Unaligned)]
+#[derive(
+    Copy,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    FromZeros,
+    FromBytes,
+    AsBytes,
+    NoCell,
+    Unaligned,
+)]
 #[repr(transparent)]
 pub struct Ipv4Addr([u8; 4]);
 
@@ -1378,9 +1649,28 @@ impl Ipv4Addr {
     ///
     /// [RFC 4291 Section 2.5.5.2]: https://tools.ietf.org/html/rfc4291#section-2.5.5.2
     #[inline]
-    pub fn to_ipv6_mapped(self) -> Ipv6Addr {
+    pub fn to_ipv6_mapped(self) -> SpecifiedAddr<Ipv6Addr> {
         let Self([a, b, c, d]) = self;
-        Ipv6Addr::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, a, b, c, d])
+        SpecifiedAddr::new(Ipv6Addr::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, a, b, c, d]))
+            .unwrap()
+    }
+
+    /// Returns the address's class according to the obsoleted classful
+    /// addressing architecture.
+    pub fn class(&self) -> Ipv4AddressClass {
+        for (subnet, class) in [
+            (Ipv4::CLASS_A_SUBNET, Ipv4AddressClass::A),
+            (Ipv4::CLASS_B_SUBNET, Ipv4AddressClass::B),
+            (Ipv4::CLASS_C_SUBNET, Ipv4AddressClass::C),
+            (Ipv4::CLASS_D_SUBNET, Ipv4AddressClass::D),
+            (Ipv4::CLASS_E_SUBNET, Ipv4AddressClass::E),
+        ] {
+            if subnet.contains(self) {
+                return class;
+            }
+        }
+
+        unreachable!("{} should fit into a class", self)
     }
 }
 
@@ -1519,7 +1809,21 @@ impl Debug for Ipv4Addr {
 /// the same by `Ipv6Addr` as by `<std::net::Ipv6Addr as Display>::fmt`.
 ///
 /// [RFC 5952]: https://datatracker.ietf.org/doc/html/rfc5952
-#[derive(Copy, Clone, Default, PartialEq, Eq, Hash, FromBytes, AsBytes, Unaligned)]
+#[derive(
+    Copy,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    FromZeros,
+    FromBytes,
+    AsBytes,
+    NoCell,
+    Unaligned,
+)]
 #[repr(transparent)]
 pub struct Ipv6Addr([u8; 16]);
 
@@ -1684,7 +1988,7 @@ impl sealed::Sealed for Ipv6Addr {}
 /// [`Ipv4Addr::to_ipv6_mapped`].
 impl From<Ipv4Addr> for Ipv6Addr {
     fn from(addr: Ipv4Addr) -> Ipv6Addr {
-        addr.to_ipv6_mapped()
+        *addr.to_ipv6_mapped()
     }
 }
 
@@ -1790,16 +2094,13 @@ impl Display for Ipv6Addr {
         // by creating a scratch buffer, calling `fmt_inner` on that scratch
         // buffer, and then satisfying those requirements.
         fn fmt_inner<W: fmt::Write>(addr: &Ipv6Addr, w: &mut W) -> Result<(), fmt::Error> {
-            // We special-case the unspecified and localhost addresses because
-            // both addresses are valid IPv4-compatible addresses, and so if we
-            // don't special case them, they'll get printed as IPv4-compatible
-            // addresses ("::0.0.0.0" and "::0.0.0.1") respectively.
+            // We special-case the unspecified address, localhost address, and
+            // IPv4-mapped addresses, but not IPv4-compatible addresses. We
+            // follow Rust's behavior here: https://github.com/rust-lang/rust/pull/112606
             if !addr.is_specified() {
                 write!(w, "::")
             } else if addr.is_loopback() {
                 write!(w, "::1")
-            } else if let Some(v4) = addr.to_ipv4_compatible() {
-                write!(w, "::{}", v4)
             } else if let Some(v4) = addr.to_ipv4_mapped() {
                 write!(w, "::ffff:{}", v4)
             } else {
@@ -1927,11 +2228,13 @@ impl Debug for Ipv6Addr {
 /// The source address from an IPv6 packet.
 ///
 /// An `Ipv6SourceAddr` represents the source address from an IPv6 packet, which
-/// may only be either unicast or unspecified.
+/// may only be either:
+///   * unicast and non-mapped (e.g. not an ipv4-mapped-ipv6 address), or
+///   * unspecified.
 #[allow(missing_docs)]
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub enum Ipv6SourceAddr {
-    Unicast(UnicastAddr<Ipv6Addr>),
+    Unicast(NonMappedAddr<UnicastAddr<Ipv6Addr>>),
     Unspecified,
 }
 
@@ -1940,11 +2243,12 @@ impl crate::sealed::Sealed for Ipv6SourceAddr {}
 impl Ipv6SourceAddr {
     /// Constructs a new `Ipv6SourceAddr`.
     ///
-    /// Returns `None` if `addr` is neither unicast nor unspecified.
+    /// Returns `None` if `addr` does not satisfy the properties required of an
+    /// `Ipv6SourceAddr`.
     #[inline]
     pub fn new(addr: Ipv6Addr) -> Option<Ipv6SourceAddr> {
         if let Some(addr) = UnicastAddr::new(addr) {
-            Some(Ipv6SourceAddr::Unicast(addr))
+            NonMappedAddr::new(addr).map(Ipv6SourceAddr::Unicast)
         } else if !addr.is_specified() {
             Some(Ipv6SourceAddr::Unspecified)
         } else {
@@ -1967,7 +2271,7 @@ impl Witness<Ipv6Addr> for Ipv6SourceAddr {
     #[inline]
     fn into_addr(self) -> Ipv6Addr {
         match self {
-            Ipv6SourceAddr::Unicast(addr) => addr.get(),
+            Ipv6SourceAddr::Unicast(addr) => **addr,
             Ipv6SourceAddr::Unspecified => Ipv6::UNSPECIFIED_ADDRESS,
         }
     }
@@ -1992,6 +2296,13 @@ impl LinkLocalAddress for Ipv6SourceAddr {
     }
 }
 
+impl MappedAddress for Ipv6SourceAddr {
+    fn is_non_mapped(&self) -> bool {
+        let addr: Ipv6Addr = self.into();
+        addr.is_non_mapped()
+    }
+}
+
 impl From<Ipv6SourceAddr> for Ipv6Addr {
     fn from(addr: Ipv6SourceAddr) -> Ipv6Addr {
         addr.get()
@@ -2004,12 +2315,6 @@ impl From<&'_ Ipv6SourceAddr> for Ipv6Addr {
             Ipv6SourceAddr::Unicast(addr) => addr.get(),
             Ipv6SourceAddr::Unspecified => Ipv6::UNSPECIFIED_ADDRESS,
         }
-    }
-}
-
-impl From<UnicastAddr<Ipv6Addr>> for Ipv6SourceAddr {
-    fn from(addr: UnicastAddr<Ipv6Addr>) -> Ipv6SourceAddr {
-        Ipv6SourceAddr::Unicast(addr)
     }
 }
 
@@ -2129,6 +2434,15 @@ impl LinkLocalAddress for UnicastOrMulticastIpv6Addr {
     }
 }
 
+impl MappedAddress for UnicastOrMulticastIpv6Addr {
+    fn is_non_mapped(&self) -> bool {
+        match self {
+            UnicastOrMulticastIpv6Addr::Unicast(addr) => addr.is_non_mapped(),
+            UnicastOrMulticastIpv6Addr::Multicast(addr) => addr.is_non_mapped(),
+        }
+    }
+}
+
 impl From<UnicastOrMulticastIpv6Addr> for Ipv6Addr {
     fn from(addr: UnicastOrMulticastIpv6Addr) -> Ipv6Addr {
         addr.get()
@@ -2218,6 +2532,24 @@ pub struct Subnet<A> {
     // invariant: only contains prefix bits
     network: A,
     prefix: u8,
+}
+
+impl<A: core::cmp::Ord> core::cmp::PartialOrd for Subnet<A> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Subnet ordering always orders from least-specific to most-specific subnet.
+impl<A: core::cmp::Ord> core::cmp::Ord for Subnet<A> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        let Self { network, prefix } = self;
+        let Self { network: other_network, prefix: other_prefix } = other;
+        match prefix.cmp(other_prefix) {
+            core::cmp::Ordering::Equal => network.cmp(other_network),
+            ord => ord,
+        }
+    }
 }
 
 impl<A> Subnet<A> {
@@ -2434,6 +2766,23 @@ impl<S: IpAddress, A: Witness<S> + Copy> AddrSubnet<S, A> {
         AddrSubnet::from_witness(A::new(addr).ok_or(AddrSubnetError::InvalidWitness)?, prefix)
     }
 
+    /// Creates a new `AddrSubnet` without checking for validity.
+    ///
+    /// # Safety
+    ///
+    /// Unlike [`new`], `new_unchecked` does not validate that `prefix` is in the
+    /// proper range, and does not check that `addr` is a valid value for the
+    /// witness type `A`. It is up to the caller to guarantee that `prefix` is
+    /// in the proper range, and `A::new(addr)` is not `None`.
+    ///
+    /// [`new`]: AddrSubnet::new
+    #[inline]
+    pub unsafe fn new_unchecked(addr: S, prefix: u8) -> Self {
+        let (subnet, addr) =
+            unsafe { (Subnet::new_unchecked(addr.mask(prefix), prefix), A::new_unchecked(addr)) };
+        AddrSubnet { addr, subnet }
+    }
+
     /// Creates a new `AddrSubnet` from an existing witness.
     ///
     /// `from_witness` creates a new `AddrSubnet` with the given address and
@@ -2479,6 +2828,20 @@ impl<S: IpAddress, A: Witness<S> + Copy> AddrSubnet<S, A> {
     {
         AddrSubnet { addr: self.addr.into(), subnet: self.subnet }
     }
+
+    /// Wraps an additional witness onto this [`AddrSubnet`].
+    #[inline]
+    pub fn add_witness<B: Witness<A> + Witness<S> + Copy>(&self) -> Option<AddrSubnet<S, B>> {
+        let addr = B::new(self.addr)?;
+        Some(AddrSubnet { addr, subnet: self.subnet })
+    }
+
+    /// Replaces the [`AddrSubnet`] witness.
+    #[inline]
+    pub fn replace_witness<B: Witness<S> + Copy>(&self) -> Option<AddrSubnet<S, B>> {
+        let addr = B::new(self.addr.get())?;
+        Some(AddrSubnet { addr, subnet: self.subnet })
+    }
 }
 
 impl<S: IpAddress, A: Witness<S> + Copy + Display> Display for AddrSubnet<S, A> {
@@ -2509,6 +2872,95 @@ impl<A: Witness<Ipv6Addr> + Copy> AddrSubnet<Ipv6Addr, A> {
         AddrSubnet { addr, subnet }
     }
 }
+
+/// An IP prefix length.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, GenericOverIp)]
+#[generic_over_ip(I, Ip)]
+pub struct PrefixLength<I: Ip> {
+    /// `inner` is guaranteed to be a valid prefix length for `I::Addr`.
+    inner: u8,
+    _ip: IpVersionMarker<I>,
+}
+
+impl<I: Ip> PrefixLength<I> {
+    /// Returns the prefix length.
+    ///
+    /// The returned length is guaranteed to be a valid prefix length for
+    /// `I::Addr`.
+    pub const fn get(self) -> u8 {
+        let Self { inner, _ip } = self;
+        inner
+    }
+
+    /// Gets the subnet-mask representation of this prefix length.
+    pub fn get_mask(self) -> I::Addr {
+        I::map_ip(
+            self,
+            |prefix_len| Ipv4::LIMITED_BROADCAST_ADDRESS.mask(prefix_len.get()),
+            |prefix_len| Ipv6Addr([u8::MAX; 16]).mask(prefix_len.get()),
+        )
+    }
+
+    /// Constructs a `PrefixLength` from a given prefix length without checking
+    /// whether it is too long for the address type.
+    ///
+    /// # Safety
+    /// `prefix_length` must be less than or equal to the number of bits in
+    /// `I::Addr`. In other words, `prefix_length <= I::Addr::BYTES * 8`.
+    pub const unsafe fn new_unchecked(prefix_length: u8) -> Self {
+        Self { inner: prefix_length, _ip: I::VERSION_MARKER }
+    }
+
+    /// Constructs a `PrefixLength` from a given unverified prefix length.
+    ///
+    /// Returns `Err(PrefixTooLongError)` if `prefix_length` is too long for the
+    /// address type.
+    pub const fn new(prefix_length: u8) -> Result<Self, PrefixTooLongError> {
+        if prefix_length > I::Addr::BYTES * 8 {
+            return Err(PrefixTooLongError);
+        }
+        Ok(Self { inner: prefix_length, _ip: I::VERSION_MARKER })
+    }
+
+    /// Constructs a `PrefixLength` from an IP address representing a subnet mask.
+    ///
+    /// Returns `Err(NotSubnetMaskError)` if `subnet_mask` is not a valid subnet
+    /// mask.
+    pub fn try_from_subnet_mask(subnet_mask: I::Addr) -> Result<Self, NotSubnetMaskError> {
+        let IpInvariant((count_ones, leading_ones)) = I::map_ip(
+            subnet_mask,
+            |subnet_mask| {
+                let number = u32::from_be_bytes(subnet_mask.ipv4_bytes());
+                IpInvariant((number.count_ones(), number.leading_ones()))
+            },
+            |subnet_mask| {
+                let number = u128::from_be_bytes(subnet_mask.ipv6_bytes());
+                IpInvariant((number.count_ones(), number.leading_ones()))
+            },
+        );
+
+        if leading_ones != count_ones {
+            return Err(NotSubnetMaskError);
+        }
+
+        Ok(Self {
+            inner: u8::try_from(leading_ones)
+                .expect("the number of bits in an IP address fits in u8"),
+            _ip: IpVersionMarker::default(),
+        })
+    }
+}
+
+impl<I: Ip> From<PrefixLength<I>> for u8 {
+    fn from(value: PrefixLength<I>) -> Self {
+        value.get()
+    }
+}
+
+/// An IP address was provided which is not a valid subnet mask (the address
+/// has set bits after the first unset bit).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct NotSubnetMaskError;
 
 /// A type which is witness to some property about an [`IpAddress`], `A`.
 ///
@@ -2622,6 +3074,27 @@ impl<A: IpAddrWitness> AddrSubnetEither<A> {
         })
     }
 
+    /// Creates a new `AddrSubnetEither` from trusted inputs.
+    ///
+    /// # Safety
+    ///
+    /// Unlike [`new`], this assumes that the provided address satisfies the
+    /// requirements of the witness type `A`, and that `prefix` is not too large
+    /// for the IP version of the address in `addr`.
+    ///
+    /// [`new`]: AddrSubnetEither::new
+    #[inline]
+    pub unsafe fn new_unchecked(addr: IpAddr, prefix: u8) -> Self {
+        match addr {
+            IpAddr::V4(addr) => {
+                AddrSubnetEither::V4(unsafe { AddrSubnet::new_unchecked(addr, prefix) })
+            }
+            IpAddr::V6(addr) => {
+                AddrSubnetEither::V6(unsafe { AddrSubnet::new_unchecked(addr, prefix) })
+            }
+        }
+    }
+
     /// Gets the IP address.
     pub fn addr(&self) -> A {
         match self {
@@ -2693,7 +3166,6 @@ where
 /// Implementations of this trait should generally be themselves generic over
 /// `Ip`. For example:
 /// ```
-/// use net_types::ip::{Ip, GenericOverIp, Subnet};
 /// struct AddrAndSubnet<I: Ip> {
 ///   addr: I::Addr,
 ///   subnet: Subnet<I::Addr>
@@ -2715,12 +3187,75 @@ pub trait GenericOverIp<NewIp: Ip> {
 /// some portion that is invariant over IP version.
 pub struct IpInvariant<T>(pub T);
 
+impl<T> IpInvariant<T> {
+    /// Consumes the `IpInvariant` and returns the wrapped value.
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
 impl<I: Ip, T> GenericOverIp<I> for IpInvariant<T> {
     type Type = Self;
 }
 
 impl<I: Ip> GenericOverIp<I> for core::convert::Infallible {
     type Type = Self;
+}
+
+/// A wrapper structure to add an IP version marker to an IP-invariant type.
+#[derive(GenericOverIp, Default, Debug, PartialOrd, Ord, Eq, PartialEq, Hash)]
+#[generic_over_ip(I, Ip)]
+pub struct IpMarked<I: Ip, T> {
+    inner: T,
+    _marker: IpVersionMarker<I>,
+}
+
+impl<I: Ip, T> Deref for IpMarked<I, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl<I: Ip, T> DerefMut for IpMarked<I, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut()
+    }
+}
+impl<I: Ip, T> AsRef<T> for IpMarked<I, T> {
+    fn as_ref(&self) -> &T {
+        &self.inner
+    }
+}
+
+impl<I: Ip, T> AsMut<T> for IpMarked<I, T> {
+    fn as_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+}
+
+impl<I: Ip, T> IpMarked<I, T> {
+    /// Constructs a new `IpMarked` from the provided `T`.
+    pub fn new(inner: T) -> Self {
+        Self { inner, _marker: IpVersionMarker::<I>::new() }
+    }
+
+    /// Consumes the `IpMarked` and returns the contained `T` by value.
+    pub fn into_inner(self) -> T {
+        let Self { inner, _marker } = self;
+        inner
+    }
+
+    /// Gets an immutable reference to the underlying `T`.
+    pub fn get(&self) -> &T {
+        self.as_ref()
+    }
+
+    /// Gets an mutable reference to the underlying `T`.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.as_mut()
+    }
 }
 
 /// Calls the provided macro with all suffixes of the input.
@@ -2793,6 +3328,9 @@ mod tests {
     use core::convert::TryInto;
 
     use super::*;
+    use test_case::test_case;
+
+    use crate::NonMappedAddr;
 
     #[test]
     fn test_map_ip_associated_constant() {
@@ -2881,6 +3419,126 @@ mod tests {
 
         assert_eq!(from_be_bytes(Ipv4::LOOPBACK_ADDRESS.get()), Int(0x7f000001u32));
         assert_eq!(from_be_bytes(Ipv6::LOOPBACK_ADDRESS.get()), Int(1u128));
+    }
+
+    #[test]
+    fn map_ip_twice() {
+        struct FooV4 {
+            field: Ipv4Addr,
+        }
+
+        impl Default for FooV4 {
+            fn default() -> Self {
+                Self { field: Ipv4::UNSPECIFIED_ADDRESS }
+            }
+        }
+
+        struct FooV6 {
+            field: Ipv6Addr,
+        }
+
+        impl Default for FooV6 {
+            fn default() -> Self {
+                Self { field: Ipv6::UNSPECIFIED_ADDRESS }
+            }
+        }
+
+        trait IpExt {
+            type Foo: Default;
+        }
+
+        impl IpExt for Ipv4 {
+            type Foo = FooV4;
+        }
+
+        impl IpExt for Ipv6 {
+            type Foo = FooV6;
+        }
+
+        #[derive(GenericOverIp)]
+        #[generic_over_ip(I, Ip)]
+        struct Foo<I: IpExt>(I::Foo);
+
+        fn do_something<I: Ip + IpExt>(
+            foo: Foo<I>,
+            extra_foo: Foo<I>,
+            captured_foo: Foo<I>,
+        ) -> I::Addr {
+            let addr: I::Addr = map_ip_twice!(I, foo, |Foo(foo)| { foo.field });
+
+            // Observe that we can use an associated item with `map_ip_twice!
+            // too.
+            let _: I::Addr =
+                map_ip_twice!(<<I as Ip>::Addr as IpAddress>::Version, extra_foo, |Foo(foo)| {
+                    // Since `captured_foo` is captured rather than fed through the
+                    // generic-over-ip input, this wouldn't work if `I` was aliased
+                    // concretely to `Ipv4` or `Ipv6`.
+                    let _: &Foo<I> = &captured_foo;
+                    foo.field
+                });
+
+            addr
+        }
+
+        assert_eq!(
+            do_something(
+                Foo::<Ipv4>(FooV4 { field: Ipv4::UNSPECIFIED_ADDRESS }),
+                Foo::<Ipv4>(FooV4 { field: Ipv4::UNSPECIFIED_ADDRESS }),
+                Foo::<Ipv4>(FooV4 { field: Ipv4::UNSPECIFIED_ADDRESS })
+            ),
+            Ipv4::UNSPECIFIED_ADDRESS
+        );
+        assert_eq!(
+            do_something(
+                Foo::<Ipv6>(FooV6 { field: Ipv6::UNSPECIFIED_ADDRESS }),
+                Foo::<Ipv6>(FooV6 { field: Ipv6::UNSPECIFIED_ADDRESS }),
+                Foo::<Ipv6>(FooV6 { field: Ipv6::UNSPECIFIED_ADDRESS })
+            ),
+            Ipv6::UNSPECIFIED_ADDRESS
+        );
+
+        fn do_something_with_default_type_alias_shadowing<I: Ip>() -> (I::Addr, IpVersion) {
+            let (field, IpInvariant(version)) = map_ip_twice!(I, (), |()| {
+                // Note that there's no `IpExt` bound on `I`, so `I` wouldn't
+                // work here unless it was automatically aliased to `Ipv4` or `Ipv6`.
+                let foo: Foo<I> = Foo(<I as IpExt>::Foo::default());
+                (foo.0.field, IpInvariant(I::VERSION))
+            },);
+            (field, version)
+        }
+
+        fn do_something_with_type_alias<I: Ip>() -> (I::Addr, IpVersion) {
+            // Show that the type alias inside the macro shadows
+            // whatever it was bound to outside the macro.
+            #[allow(dead_code)]
+            type IpAlias = usize;
+
+            let (field, IpInvariant(version)) = map_ip_twice!(I as IpAlias, (), |()| {
+                // Note that there's no `IpExt` bound on `I`, so `I` wouldn't
+                // work here -- only `IpAlias`, since `IpAlias` is explicitly
+                // an alias of `Ipv4` or `Ipv6`.
+                let foo: Foo<IpAlias> = Foo(<IpAlias as IpExt>::Foo::default());
+                (foo.0.field, IpInvariant(IpAlias::VERSION))
+            },);
+            (field, version)
+        }
+
+        assert_eq!(
+            do_something_with_default_type_alias_shadowing::<Ipv4>(),
+            (Ipv4::UNSPECIFIED_ADDRESS, IpVersion::V4)
+        );
+        assert_eq!(
+            do_something_with_default_type_alias_shadowing::<Ipv6>(),
+            (Ipv6::UNSPECIFIED_ADDRESS, IpVersion::V6)
+        );
+        assert_eq!(
+            do_something_with_type_alias::<Ipv4>(),
+            (Ipv4::UNSPECIFIED_ADDRESS, IpVersion::V4)
+        );
+        assert_eq!(
+            do_something_with_type_alias::<Ipv6>(),
+            (Ipv6::UNSPECIFIED_ADDRESS, IpVersion::V6)
+        );
     }
 
     #[test]
@@ -3154,6 +3812,76 @@ mod tests {
         }
     );
 
+    #[test_case([255, 255, 255, 0] => Ok(24))]
+    #[test_case([255, 255, 254, 0] => Ok(23))]
+    #[test_case([255, 255, 253, 0] => Err(NotSubnetMaskError))]
+    #[test_case([255, 255, 0, 255] => Err(NotSubnetMaskError))]
+    #[test_case([255, 255, 255, 255] => Ok(32))]
+    #[test_case([0, 0, 0, 0] => Ok(0))]
+    #[test_case([0, 0, 0, 255] => Err(NotSubnetMaskError))]
+    fn test_ipv4_prefix_len_try_from_subnet_mask(
+        subnet_mask: [u8; 4],
+    ) -> Result<u8, NotSubnetMaskError> {
+        let subnet_mask = Ipv4Addr::from(subnet_mask);
+        PrefixLength::<Ipv4>::try_from_subnet_mask(subnet_mask).map(|prefix_len| prefix_len.get())
+    }
+
+    #[test_case([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0] => Ok(64))]
+    #[test_case([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE, 0, 0, 0, 0, 0, 0, 0, 0] => Ok(63))]
+    #[test_case([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0] => Err(NotSubnetMaskError))]
+    #[test_case([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE, 0, 0, 0, 0, 0, 0, 0, 1] => Err(NotSubnetMaskError))]
+    #[test_case([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] => Ok(0))]
+    #[test_case([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF] => Ok(128))]
+    #[test_case([0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0] => Err(NotSubnetMaskError))]
+    fn test_ipv6_prefix_len_try_from_subnet_mask(
+        subnet_mask: [u8; 16],
+    ) -> Result<u8, NotSubnetMaskError> {
+        let subnet_mask = Ipv6Addr::from(subnet_mask);
+        PrefixLength::<Ipv6>::try_from_subnet_mask(subnet_mask).map(|prefix_len| prefix_len.get())
+    }
+
+    #[test_case(0 => true)]
+    #[test_case(1 => true)]
+    #[test_case(32 => true)]
+    #[test_case(33 => false)]
+    #[test_case(128 => false)]
+    #[test_case(129 => false)]
+    #[test_case(255 => false)]
+    fn test_ipv4_prefix_len_new(prefix_len: u8) -> bool {
+        PrefixLength::<Ipv4>::new(prefix_len).is_ok()
+    }
+
+    #[test_case(0 => true)]
+    #[test_case(1 => true)]
+    #[test_case(32 => true)]
+    #[test_case(33 => true)]
+    #[test_case(128 => true)]
+    #[test_case(129 => false)]
+    #[test_case(255 => false)]
+    fn test_ipv6_prefix_len_new(prefix_len: u8) -> bool {
+        PrefixLength::<Ipv6>::new(prefix_len).is_ok()
+    }
+
+    #[test_case(0 => [0, 0, 0, 0])]
+    #[test_case(6 => [252, 0, 0, 0])]
+    #[test_case(16 => [255, 255, 0, 0])]
+    #[test_case(25 => [255, 255, 255, 128])]
+    #[test_case(32 => [255, 255, 255, 255])]
+    fn test_ipv4_prefix_len_get_mask(prefix_len: u8) -> [u8; 4] {
+        let Ipv4Addr(inner) = PrefixLength::<Ipv4>::new(prefix_len).unwrap().get_mask();
+        inner
+    }
+
+    #[test_case(0 => [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])]
+    #[test_case(6 => [0xFC, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])]
+    #[test_case(64 => [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0])]
+    #[test_case(65 => [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x80, 0, 0, 0, 0, 0, 0, 0])]
+    #[test_case(128 => [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])]
+    fn test_ipv6_prefix_len_get_mask(prefix_len: u8) -> [u8; 16] {
+        let Ipv6Addr(inner) = PrefixLength::<Ipv6>::new(prefix_len).unwrap().get_mask();
+        inner
+    }
+
     #[test]
     fn test_ipv6_solicited_node() {
         let addr = Ipv6Addr::new([0xfe80, 0, 0, 0, 0x52e5, 0x49ff, 0xfeb5, 0x5aa0]);
@@ -3260,7 +3988,7 @@ mod tests {
             Ipv6Addr::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4])
         );
         assert_eq!(
-            Ipv4Addr::new([1, 2, 3, 4]).to_ipv6_mapped(),
+            Ipv4Addr::new([1, 2, 3, 4]).to_ipv6_mapped().get(),
             Ipv6Addr::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 1, 2, 3, 4]),
         );
 
@@ -3279,6 +4007,17 @@ mod tests {
 
         assert_eq!(not_embedded.to_ipv4_compatible(), None);
         assert_eq!(not_embedded.to_ipv4_mapped(), None);
+
+        assert_eq!(
+            NonMappedAddr::new(compatible),
+            Some(unsafe { NonMappedAddr::new_unchecked(compatible) })
+        );
+        assert_eq!(NonMappedAddr::new(mapped), None);
+        assert_eq!(
+            NonMappedAddr::new(not_embedded),
+            Some(unsafe { NonMappedAddr::new_unchecked(not_embedded) })
+        );
+        assert_eq!(NonMappedAddr::new(v4), Some(unsafe { NonMappedAddr::new_unchecked(v4) }));
     }
 
     #[test]
@@ -3367,6 +4106,40 @@ mod tests {
         }
     }
 
+    #[test_case(Ipv4::UNSPECIFIED_ADDRESS, Ipv4AddressClass::A; "first_class_a")]
+    #[test_case(Ipv4Addr::new([127, 255, 255, 255]), Ipv4AddressClass::A; "last_class_a")]
+    #[test_case(Ipv4Addr::new([128, 0, 0, 0]), Ipv4AddressClass::B; "first_class_b")]
+    #[test_case(Ipv4Addr::new([191, 255, 255, 255]), Ipv4AddressClass::B; "last_class_b")]
+    #[test_case(Ipv4Addr::new([192, 0, 0, 0]), Ipv4AddressClass::C; "first_class_c")]
+    #[test_case(Ipv4Addr::new([223, 255, 255, 255]), Ipv4AddressClass::C; "last_class_c")]
+    #[test_case(Ipv4Addr::new([224, 0, 0, 0]), Ipv4AddressClass::D; "first_class_d")]
+    #[test_case(Ipv4Addr::new([239, 255, 255, 255]), Ipv4AddressClass::D; "last_class_d")]
+    #[test_case(Ipv4Addr::new([240, 0, 0, 0]), Ipv4AddressClass::E; "first_class_e")]
+    #[test_case(Ipv4Addr::new([255, 255, 255, 255]), Ipv4AddressClass::E; "last_class_e")]
+    fn ipv4addr_class(addr: Ipv4Addr, class: Ipv4AddressClass) {
+        assert_eq!(addr.class(), class)
+    }
+
+    #[test_case(
+        Subnet::new(Ipv4Addr::new([192, 168, 1, 0]), 24).unwrap(),
+        Subnet::new(Ipv4Addr::new([192, 168, 2, 0]), 24).unwrap()
+    ; "ipv4_same_prefix")]
+    #[test_case(
+        Subnet::new(Ipv4Addr::new([192, 168, 2, 0]), 24).unwrap(),
+        Subnet::new(Ipv4Addr::new([192, 168, 1, 0]), 32).unwrap()
+    ; "ipv4_by_prefix")]
+    #[test_case(
+        Subnet::new(Ipv6Addr::new([1, 0, 0, 0, 0, 0, 0, 0]), 64).unwrap(),
+        Subnet::new(Ipv6Addr::new([2, 0, 0, 0, 0, 0, 0, 0]), 64).unwrap()
+    ; "ipv6_same_prefix")]
+    #[test_case(
+        Subnet::new(Ipv6Addr::new([2, 0, 0, 0, 0, 0, 0, 0]), 64).unwrap(),
+        Subnet::new(Ipv6Addr::new([1, 0, 0, 0, 0, 0, 0, 0]), 128).unwrap()
+    ; "ipv6_by_prefix")]
+    fn subnet_ord<A: core::cmp::Ord>(a: Subnet<A>, b: Subnet<A>) {
+        assert!(a < b);
+    }
+
     #[cfg(feature = "std")]
     mod std_tests {
         use std::net;
@@ -3443,8 +4216,21 @@ mod macro_test {
     fn struct_with_ip_version_parameter() {
         #[allow(dead_code)]
         #[derive(GenericOverIp)]
+        #[generic_over_ip(I, Ip)]
         struct Generic<I: Ip> {
             addr: I::Addr,
+        }
+
+        assert_ip_generic!(Generic, Ip);
+    }
+
+    #[test]
+    fn struct_with_unbounded_ip_version_parameter() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        #[generic_over_ip(I, Ip)]
+        struct Generic<I> {
+            addr: core::marker::PhantomData<I>,
         }
 
         assert_ip_generic!(Generic, Ip);
@@ -3454,6 +4240,7 @@ mod macro_test {
     fn struct_with_ip_address_parameter() {
         #[allow(dead_code)]
         #[derive(GenericOverIp)]
+        #[generic_over_ip(A, IpAddress)]
         struct Generic<A: IpAddress> {
             addr: A,
         }
@@ -3462,9 +4249,53 @@ mod macro_test {
     }
 
     #[test]
+    fn struct_with_unbounded_ip_address_parameter() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        #[generic_over_ip(A, IpAddress)]
+        struct Generic<A> {
+            addr: A,
+        }
+
+        assert_ip_generic!(Generic, IpAddress);
+    }
+
+    #[test]
+    fn struct_with_generic_over_ip_parameter() {
+        #[derive(GenericOverIp)]
+        #[generic_over_ip(I, Ip)]
+        struct InnerGeneric<I: Ip> {
+            addr: I::Addr,
+        }
+
+        #[derive(GenericOverIp)]
+        #[generic_over_ip(T, GenericOverIp)]
+        struct Generic<T> {
+            foo: T,
+        }
+
+        fn do_something<I: Ip>(g: Generic<InnerGeneric<I>>) {
+            I::map_ip(
+                g,
+                |g| {
+                    let _: Ipv4Addr = g.foo.addr;
+                },
+                |g| {
+                    let _: Ipv6Addr = g.foo.addr;
+                },
+            )
+        }
+
+        do_something::<Ipv4>(Generic { foo: InnerGeneric { addr: Ipv4::UNSPECIFIED_ADDRESS } });
+
+        do_something::<Ipv6>(Generic { foo: InnerGeneric { addr: Ipv6::UNSPECIFIED_ADDRESS } });
+    }
+
+    #[test]
     fn enum_with_ip_version_parameter() {
         #[allow(dead_code)]
         #[derive(GenericOverIp)]
+        #[generic_over_ip(I, Ip)]
         enum Generic<I: Ip> {
             A(I::Addr),
             B(I::Addr),
@@ -3474,10 +4305,37 @@ mod macro_test {
     }
 
     #[test]
+    fn enum_with_unbounded_ip_version_parameter() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        #[generic_over_ip(I, Ip)]
+        enum Generic<I> {
+            A(core::marker::PhantomData<I>),
+            B(core::marker::PhantomData<I>),
+        }
+
+        assert_ip_generic!(Generic, Ip);
+    }
+
+    #[test]
     fn enum_with_ip_address_parameter() {
         #[allow(dead_code)]
         #[derive(GenericOverIp)]
+        #[generic_over_ip(A, IpAddress)]
         enum Generic<A: IpAddress> {
+            A(A),
+            B(A),
+        }
+
+        assert_ip_generic!(Generic, IpAddress);
+    }
+
+    #[test]
+    fn enum_with_unbounded_ip_address_parameter() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        #[generic_over_ip(A, IpAddress)]
+        enum Generic<A> {
             A(A),
             B(A),
         }
@@ -3489,6 +4347,7 @@ mod macro_test {
     fn struct_with_ip_version_and_other_parameters() {
         #[allow(dead_code)]
         #[derive(GenericOverIp)]
+        #[generic_over_ip(I, Ip)]
         struct AddrAndDevice<I: Ip, D> {
             addr: I::Addr,
             device: D,
@@ -3502,6 +4361,7 @@ mod macro_test {
     fn enum_with_ip_version_and_other_parameters() {
         #[allow(dead_code)]
         #[derive(GenericOverIp)]
+        #[generic_over_ip(I, Ip)]
         enum AddrOrDevice<I: Ip, D> {
             Addr(I::Addr),
             Device(D),
@@ -3515,7 +4375,22 @@ mod macro_test {
     fn struct_with_ip_address_and_other_parameters() {
         #[allow(dead_code)]
         #[derive(GenericOverIp)]
+        #[generic_over_ip(A, IpAddress)]
         struct AddrAndDevice<A: IpAddress, D> {
+            addr: A,
+            device: D,
+        }
+        struct Device;
+
+        assert_ip_generic!(AddrAndDevice, IpAddress, Device);
+    }
+
+    #[test]
+    fn struct_with_unbounded_ip_address_and_other_parameters() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        #[generic_over_ip(A, IpAddress)]
+        struct AddrAndDevice<A, D> {
             addr: A,
             device: D,
         }
@@ -3528,6 +4403,7 @@ mod macro_test {
     fn enum_with_ip_address_and_other_parameters() {
         #[allow(dead_code)]
         #[derive(GenericOverIp, Debug, PartialEq)]
+        #[generic_over_ip(A, IpAddress)]
         enum AddrOrDevice<A: IpAddress, D> {
             Addr(A),
             Device(D),
@@ -3541,6 +4417,7 @@ mod macro_test {
     fn struct_invariant_over_ip() {
         #[allow(dead_code)]
         #[derive(GenericOverIp)]
+        #[generic_over_ip()]
         struct Invariant(usize);
 
         assert_ip_generic!(Invariant);
@@ -3550,6 +4427,7 @@ mod macro_test {
     fn enum_invariant_over_ip() {
         #[allow(dead_code)]
         #[derive(GenericOverIp)]
+        #[generic_over_ip()]
         enum Invariant {
             Usize(usize),
         }
@@ -3561,6 +4439,7 @@ mod macro_test {
     fn struct_invariant_over_ip_with_other_params() {
         #[allow(dead_code)]
         #[derive(GenericOverIp)]
+        #[generic_over_ip()]
         struct Invariant<B, C, D>(B, C, D);
 
         assert_ip_generic!(Invariant, usize, bool, char);
@@ -3570,6 +4449,7 @@ mod macro_test {
     fn enum_invariant_over_ip_with_other_params() {
         #[allow(dead_code)]
         #[derive(GenericOverIp)]
+        #[generic_over_ip()]
         enum Invariant<A, B, C> {
             A(A),
             B(B),
@@ -3593,7 +4473,30 @@ mod macro_test {
 
         #[allow(dead_code)]
         #[derive(GenericOverIp)]
-        struct Generic<I: Ip + FakeIpExt> {
+        #[generic_over_ip(I, Ip)]
+        struct Generic<I: FakeIpExt> {
+            field: I::Associated,
+        }
+
+        assert_ip_generic!(Generic, Ip);
+    }
+
+    #[test]
+    fn struct_with_ip_version_extension_parameter_but_no_ip_bound() {
+        trait FakeIpExt: Ip {
+            type Associated;
+        }
+        impl FakeIpExt for Ipv4 {
+            type Associated = u8;
+        }
+        impl FakeIpExt for Ipv6 {
+            type Associated = u16;
+        }
+
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        #[generic_over_ip(I, Ip)]
+        struct Generic<I: FakeIpExt> {
             field: I::Associated,
         }
 
@@ -3614,6 +4517,7 @@ mod macro_test {
 
         #[allow(dead_code)]
         #[derive(GenericOverIp)]
+        #[generic_over_ip(A, IpAddress)]
         struct Generic<A: IpAddress + FakeIpAddressExt> {
             field: A::Associated,
         }
@@ -3625,6 +4529,7 @@ mod macro_test {
     fn type_with_lifetime_and_ip_parameter() {
         #[allow(dead_code)]
         #[derive(GenericOverIp)]
+        #[generic_over_ip(I, Ip)]
         struct Generic<'a, I: Ip> {
             field: &'a I::Addr,
         }
@@ -3633,5 +4538,37 @@ mod macro_test {
         assert_ip_generic_is::<Generic<'static, Ipv4>, Ipv6, Generic<'static, Ipv6>>();
         assert_ip_generic_is::<Generic<'static, Ipv6>, Ipv4, Generic<'static, Ipv4>>();
         assert_ip_generic_is::<Generic<'static, Ipv6>, Ipv6, Generic<'static, Ipv6>>();
+    }
+
+    #[test]
+    fn type_with_lifetime_and_no_ip_parameter() {
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        #[generic_over_ip()]
+        struct Generic<'a> {
+            field: &'a (),
+        }
+
+        assert_ip_generic_is::<Generic<'static>, Ipv4, Generic<'static>>();
+        assert_ip_generic_is::<Generic<'static>, Ipv6, Generic<'static>>();
+    }
+
+    #[test]
+    fn type_with_params_list_with_trailing_comma() {
+        trait IpExtensionTraitWithVeryLongName {}
+        trait OtherIpExtensionTraitWithVeryLongName {}
+        trait LongNameToForceFormatterToBreakLineAndAddTrailingComma {}
+        // Regression test for https://fxbug.dev/42080215
+        #[allow(dead_code)]
+        #[derive(GenericOverIp)]
+        #[generic_over_ip(I, Ip)]
+        struct Generic<
+            I: Ip
+                + IpExtensionTraitWithVeryLongName
+                + OtherIpExtensionTraitWithVeryLongName
+                + LongNameToForceFormatterToBreakLineAndAddTrailingComma,
+        > {
+            field: I::Addr,
+        }
     }
 }
