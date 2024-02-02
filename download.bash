@@ -29,3 +29,7 @@ done
 curl --fail "https://fuchsia.googlesource.com/fuchsia/+/$when/LICENSE?format=TEXT" \
     | base64 --decode \
     > LICENSE
+
+curl --fail "https://fuchsia.googlesource.com/fuchsia/+/$when/rustfmt.toml?format=TEXT" \
+    | base64 --decode \
+    > rustfmt.toml
