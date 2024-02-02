@@ -19,7 +19,7 @@ use syn::{
 ///
 /// Consider the following example:
 ///
-/// ```
+/// ```ignore
 ///  #[derive(GenericOverIp)]
 ///  #[generic_over_ip(<ARGUMENTS EXPLAINED BELOW>)]
 ///  struct Foo<T>(T);

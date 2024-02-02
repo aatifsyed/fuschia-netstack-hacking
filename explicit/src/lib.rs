@@ -52,6 +52,7 @@ impl<T> PollExt<T> for Poll<T> {
 /// # Example
 /// ```
 /// use core::convert::Infallible as Never;
+/// use explicit::UnreachableExt as _;
 ///
 /// /// Provides guaranteed winning lottery numbers.
 /// trait LotteryOracle {
@@ -68,7 +69,7 @@ impl<T> PollExt<T> for Poll<T> {
 ///
 ///   /// Enable use with [`UnreachableExt`].
 ///   impl AsRef<Never> for UninstantiableOracle {
-///     fn as_ref(&self) -> Never {
+///     fn as_ref(&self) -> &Never {
 ///       &self.0
 ///     }
 ///   }
