@@ -16,8 +16,12 @@ net-types = { path = "../net-types" }
 nonzero_ext = "0.3.0"
 packet = { path = "../packet" }
 thiserror = "1.0.30"
-zerocopy = "0.7.0-alpha.2"
+tracing = "0.1.40"
+const-unwrap = { path = "../const-unwrap" }
+zerocopy = { version = "0.8.0-alpha.2", features = ["derive"] }
+derivative = { version = "2.2.0", features = ["use_core"] }
 
 [dev-dependencies]
 assert_matches = "1.5.0"
 test-case = "1.2.1"
+tracing-subscriber = "0.3.18"

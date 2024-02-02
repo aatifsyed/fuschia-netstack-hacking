@@ -8,4 +8,5 @@ members = [
     "net-types",
     "packet-formats",
     "packet",
+    "const-unwrap",
 ]

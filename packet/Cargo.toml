@@ -10,7 +10,8 @@ publish = false
 arrayvec = "0.7.2"
 nonzero_ext = "0.3.0"
 test-case = "2.2.2"
-zerocopy = "0.7.0-alpha.2"
+zerocopy = { version = "0.8.0-alpha.2", features = ["derive"] }
+const-unwrap = { path = "../const-unwrap" }
 
 [dev-dependencies]
 assert_matches = "1.5.0"

@@ -13,6 +13,7 @@ folder_src_path=(
     [net-types]=src/connectivity/lib/net-types
     [packet-formats]=src/connectivity/lib/packet-formats
     [packet]=src/lib/network/packet
+    [const-unwrap]=src/lib/const-unwrap
 )
 
 for folder in "${!folder_src_path[@]}"
