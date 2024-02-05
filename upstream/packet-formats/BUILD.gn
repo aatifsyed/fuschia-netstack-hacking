@@ -1,0 +1,128 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/fuzz.gni")
+import("//build/rust/rustc_fuzzer.gni")
+import("//build/rust/rustc_library.gni")
+import("//build/rust/rustc_test.gni")
+
+_common_deps = [
+  "//src/connectivity/lib/internet-checksum",
+  "//src/connectivity/lib/net-types",
+  "//src/connectivity/network/lib/explicit",
+  "//src/lib/const-unwrap",
+  "//src/lib/network/packet",
+  "//third_party/rust_crates:arrayvec",
+  "//third_party/rust_crates:derivative",
+  "//third_party/rust_crates:thiserror",
+  "//third_party/rust_crates:tracing",
+  "//third_party/rust_crates:zerocopy",
+]
+
+_common_sources = [
+  "src/arp.rs",
+  "src/error.rs",
+  "src/ethernet.rs",
+  "src/icmp/common.rs",
+  "src/icmp/icmpv4.rs",
+  "src/icmp/icmpv6.rs",
+  "src/icmp/macros.rs",
+  "src/icmp/mld.rs",
+  "src/icmp/mod.rs",
+  "src/icmp/ndp.rs",
+  "src/icmp/testdata.rs",
+  "src/igmp/messages.rs",
+  "src/igmp/mod.rs",
+  "src/igmp/testdata.rs",
+  "src/igmp/types.rs",
+  "src/ip.rs",
+  "src/ipv4.rs",
+  "src/ipv6/ext_hdrs.rs",
+  "src/ipv6/mod.rs",
+  "src/lib.rs",
+  "src/macros.rs",
+  "src/tcp.rs",
+  "src/testdata.rs",
+  "src/testutil.rs",
+  "src/udp.rs",
+  "src/utils.rs",
+]
+
+rustc_library("packet-formats") {
+  name = "packet_formats"
+  version = "0.1.0"
+  edition = "2021"
+
+  deps = _common_deps + [
+           # TODO(https://github.com/rust-lang/rust/issues/62502): Remove this crate.
+           "//src/connectivity/network/netstack3/core/fakestd",
+         ]
+
+  sources = _common_sources
+
+  configs -= [ "//build/config/rust/lints:allow_unused_results" ]
+}
+
+rustc_test("packet-formats_test") {
+  name = "packet_formats_lib_test"
+  edition = "2021"
+
+  deps = _common_deps + [
+           "//third_party/rust_crates:assert_matches",
+           "//third_party/rust_crates:test-case",
+           "//third_party/rust_crates:tracing-subscriber",
+         ]
+
+  sources = _common_sources
+
+  configs -= [ "//build/config/rust/lints:allow_unused_results" ]
+}
+
+fuchsia_unittest_package("packet-formats-test-package") {
+  package_name = "packet-formats-test"
+  deps = [ ":packet-formats_test" ]
+}
+
+rustc_fuzzer("fuzz-parse-packet") {
+  edition = "2021"
+  sources = [ "fuzz/parse_packet.rs" ]
+  source_root = "fuzz/parse_packet.rs"
+  rustfunction = "fuzz_parse_packet"
+  deps = [
+    ":packet-formats",
+    "//src/connectivity/lib/fuzz-util",
+    "//src/connectivity/lib/net-types",
+    "//src/connectivity/lib/packet-formats-dhcp",
+    "//src/connectivity/network/dhcpv4/protocol",
+    "//src/connectivity/ppp/lib/ppp_packet",
+    "//src/lib/fuzzing/rust:fuzz",
+    "//src/lib/mdns/rust:mdns",
+    "//src/lib/network/netsvc-proto",
+    "//src/lib/network/packet",
+    "//third_party/rust_crates:arbitrary",
+    "//third_party/rust_crates:tracing",
+    "//third_party/rust_crates:tracing-subscriber",
+    "//third_party/rust_crates:zerocopy",
+  ]
+  configs -= [ "//build/config/rust/lints:allow_unused_results" ]
+}
+
+fuchsia_fuzzer_component("fuzz-parse-packet-component") {
+  manifest = "meta/fuzz-parse-packet.cml"
+  deps = [ ":fuzz-parse-packet" ]
+}
+
+fuchsia_fuzzer_package("packet-formats-fuzzers") {
+  rust_fuzzer_components = [ ":fuzz-parse-packet-component" ]
+}
+
+group("tests") {
+  testonly = true
+  public_deps = [
+    ":packet-formats-fuzzers",
+    ":packet-formats-test-package",
+    ":packet-formats_test($host_toolchain)",
+  ]
+}
