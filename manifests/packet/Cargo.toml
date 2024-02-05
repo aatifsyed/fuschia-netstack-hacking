@@ -1,0 +1,17 @@
+[package]
+name = "packet"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "../../upstream/packet/src/lib.rs"
+
+[dependencies]
+arrayvec.workspace = true
+const-unwrap.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+assert_matches.workspace = true
+rand.workspace = true
+test-case.workspace = true

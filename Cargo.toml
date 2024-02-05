@@ -1,0 +1,49 @@
+[workspace]
+members = ["manifests/*"]
+resolver = "2"
+
+[workspace.package]
+publish = false
+
+[workspace.dependencies] # /third_party/rust_crates/Cargo.toml
+arbitrary = { version = "1.0.3", features = ["derive"] }
+arrayvec = "0.7.1"
+assert_matches = "1.5.0"
+derivative = { version = "2.2.0", features = ["use_core"] }
+proc-macro2 = { version = "1.0.58", features = ["span-locations"] }
+quote = "1.0.29"
+rand = { version = "0.8", features = ["small_rng"] }
+rand_xorshift = "0.3"
+syn = { version = "1.0.98", features = [
+    "full",
+    "visit",
+    "visit-mut",
+    "extra-traits",
+] }
+test-case = "3.2.1"
+thiserror = "1.0.23"
+tracing = { version = "0.1.37", default-features = false, features = [
+    "std",
+    "attributes",
+] }
+tracing-subscriber = { version = "0.3.15", default-features = false, features = [
+    "env-filter",
+    "fmt",
+    "registry",
+    "std",
+    "tracing-log",
+] }
+zerocopy = { version = "0.8.0-alpha.1", features = [
+    "default",
+    "derive",
+    "simd",
+] }
+
+const-unwrap = { path = "manifests/const-unwrap" }
+explicit = { path = "manifests/explicit" }
+fakestd = { path = "manifests/fakestd" }
+internet-checksum = { path = "manifests/internet-checksum" }
+net-types = { path = "manifests/net-types" }
+net-types-macros = { path = "manifests/net-types-macros" }
+packet = { path = "manifests/packet" }
+packet-formats = { path = "manifests/packet-formats" }

@@ -1,0 +1,8 @@
+[package]
+name = "explicit"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "../../upstream/explicit/src/lib.rs"
+doctest = false

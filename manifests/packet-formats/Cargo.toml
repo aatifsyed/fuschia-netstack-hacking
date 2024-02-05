@@ -1,0 +1,25 @@
+[package]
+name = "packet-formats"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "../../upstream/packet-formats/src/lib.rs"
+
+[dependencies]
+arrayvec.workspace = true
+const-unwrap.workspace = true
+derivative.workspace = true
+explicit.workspace = true
+fakestd.workspace = true
+internet-checksum.workspace = true
+net-types.workspace = true
+packet.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+assert_matches.workspace = true
+test-case.workspace = true
+tracing-subscriber.workspace = true

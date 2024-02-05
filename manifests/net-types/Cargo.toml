@@ -1,0 +1,19 @@
+[package]
+name = "net-types"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["std"]
+std = []
+
+[lib]
+path = "../../upstream/net-types/src/lib.rs"
+doctest = false
+
+[dependencies]
+net-types-macros.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+test-case.workspace = true

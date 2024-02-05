@@ -1,0 +1,12 @@
+[package]
+name = "internet-checksum"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "../../upstream/internet-checksum/src/lib.rs"
+doctest = false
+
+[dev-dependencies]
+rand_xorshift.workspace = true
+rand.workspace = true
